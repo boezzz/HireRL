@@ -57,6 +57,17 @@ for _ in range(100):
         break
 ```
 
+## Training with PPO
+
+Train companies to learn optimal hiring policies using Independent PPO:
+
+```bash
+# Train with default settings (100k steps, 3 companies, 10 workers)
+python train_ppo.py
+```
+
+See [TRAINING_GUIDE.md](TRAINING_GUIDE.md) for detailed training instructions.
+
 ## Running Tests
 
 ```bash
@@ -65,6 +76,9 @@ python tests/test_simple.py
 
 # Compare baseline policies
 python tests/test_baseline_policies.py
+
+# Test PPO training
+python tests/test_ppo_training.py
 ```
 
 ## Environment Details
