@@ -160,52 +160,52 @@ class ScreeningMechanism:
 
         return unrevealed_var + noise_var
 
-    def optimal_screening_cost(
-        self,
-        expected_profit_if_good: float,
-        expected_profit_if_bad: float,
-        cost_grid: Optional[np.ndarray] = None
-    ) -> float:
-        """
-        Compute optimal screening cost using simple decision-theoretic approach.
+    # def optimal_screening_cost(
+    #     self,
+    #     expected_profit_if_good: float,
+    #     expected_profit_if_bad: float,
+    #     cost_grid: Optional[np.ndarray] = None
+    # ) -> float:
+    #     """
+    #     Compute optimal screening cost using simple decision-theoretic approach.
 
-        Firm's problem:
-            max_c { precision(c) * (V_good - V_bad) - c }
+    #     Firm's problem:
+    #         max_c { precision(c) * (V_good - V_bad) - c }
 
-        where:
-            - V_good: expected profit if worker is high ability
-            - V_bad: expected profit if worker is low ability
-            - precision(c): probability of correctly identifying type
+    #     where:
+    #         - V_good: expected profit if worker is high ability
+    #         - V_bad: expected profit if worker is low ability
+    #         - precision(c): probability of correctly identifying type
 
-        This is a simplified model. In practice, firms would use Bayesian updating
-        and dynamic programming.
+    #     This is a simplified model. In practice, firms would use Bayesian updating
+    #     and dynamic programming. #TODO: Implement Bayesian updating.
 
-        Args:
-            expected_profit_if_good: Profit from hiring good worker
-            expected_profit_if_bad: Profit from hiring bad worker
-            cost_grid: Grid of costs to search over (default: [0, 0.01, ..., c_max])
+    #     Args:
+    #         expected_profit_if_good: Profit from hiring good worker
+    #         expected_profit_if_bad: Profit from hiring bad worker
+    #         cost_grid: Grid of costs to search over (default: [0, 0.01, ..., c_max])
 
-        Returns:
-            Optimal screening cost
-        """
-        if cost_grid is None:
-            cost_grid = np.linspace(0, self.c_max, 100)
+    #     Returns:
+    #         Optimal screening cost
+    #     """
+    #     if cost_grid is None:
+    #         cost_grid = np.linspace(0, self.c_max, 100)
 
-        profit_diff = expected_profit_if_good - expected_profit_if_bad
+    #     profit_diff = expected_profit_if_good - expected_profit_if_bad
 
-        # Expected value for each screening level
-        expected_values = []
-        for c in cost_grid:
-            precision = self.get_precision(c)
-            # Value = information value - cost
-            value = precision * profit_diff - c
-            expected_values.append(value)
+    #     # Expected value for each screening level
+    #     expected_values = []
+    #     for c in cost_grid:
+    #         precision = self.get_precision(c)
+    #         # Value = information value - cost
+    #         value = precision * profit_diff - c
+    #         expected_values.append(value)
 
-        # Find cost that maximizes expected value
-        best_idx = np.argmax(expected_values)
-        optimal_cost = cost_grid[best_idx]
+    #     # Find cost that maximizes expected value
+    #     best_idx = np.argmax(expected_values)
+    #     optimal_cost = cost_grid[best_idx]
 
-        return float(optimal_cost)
+    #     return float(optimal_cost)
 
 
 class FirmBeliefs:
@@ -311,7 +311,9 @@ class FirmBeliefs:
         # Infer ability signal from performance
         # profit = σ + β*log(1+exp) + ε
         # => σ_implied = profit - β*log(1+exp)
-        experience_component = beta * np.log1p(worker_experience)
+        # Clamp experience to non-negative
+        exp_clamped = max(0.0, worker_experience)
+        experience_component = beta * np.log1p(exp_clamped)
         sigma_implied = observed_profit - experience_component
 
         # Treat as noisy signal of true ability
@@ -351,5 +353,7 @@ class FirmBeliefs:
             Expected profit
         """
         mean_ability = self.belief_mean[worker_id, 0]  # Assuming ability_dim=1
-        experience_value = beta * np.log1p(experience)
+        # Clamp experience to non-negative
+        exp_clamped = max(0.0, experience)
+        experience_value = beta * np.log1p(exp_clamped)
         return float(mean_ability + experience_value)
