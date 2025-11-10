@@ -15,16 +15,23 @@ from dataclasses import dataclass
 
 
 class RandomPolicy:
-    """Random action selection (uniform over valid actions)."""
+    """Random action selection (uniform over valid actions with action masking)."""
 
     def __init__(self, num_workers: int, seed: Optional[int] = None):
         self.num_workers = num_workers
         self.action_space_size = 1 + 3 * num_workers
         self.rng = np.random.RandomState(seed)
 
-    def get_action(self, observation: np.ndarray, agent: str) -> int:
-        """Sample random action."""
-        return self.rng.randint(0, self.action_space_size)
+    def get_action(self, observation: Dict, agent: str) -> int:
+        """Sample random action from valid actions only."""
+        # Handle dict observation format (with action masking)
+        if isinstance(observation, dict):
+            action_mask = observation['action_mask']
+            valid_actions = [i for i, valid in enumerate(action_mask) if valid == 1]
+            return self.rng.choice(valid_actions) if valid_actions else 0
+        else:
+            # Fallback for old format
+            return self.rng.randint(0, self.action_space_size)
 
 
 class GreedyPolicy:
@@ -118,7 +125,7 @@ class GreedyPolicy:
 
         return belief_mean + beta * np.log1p(experience)
 
-    def get_action(self, observation: np.ndarray, agent: str) -> int:
+    def get_action(self, observation, agent: str) -> int:
         """
         Select greedy action.
 
@@ -128,7 +135,13 @@ class GreedyPolicy:
         3. If at capacity: check if can upgrade (fire worst, hire better)
         4. Otherwise: no-op
         """
-        parsed = self._parse_observation(observation)
+        # Handle dict observation format
+        if isinstance(observation, dict):
+            obs_array = observation['observation']
+        else:
+            obs_array = observation
+
+        parsed = self._parse_observation(obs_array)
 
         # Get current workforce
         own_workforce = parsed['own_workforce']
@@ -186,7 +199,7 @@ class NoScreeningPolicy:
         )
         self.num_workers = num_workers
 
-    def get_action(self, observation: np.ndarray, agent: str) -> int:
+    def get_action(self, observation, agent: str) -> int:
         """Get greedy action, but never interview."""
         action = self.greedy_policy.get_action(observation, agent)
 
@@ -223,7 +236,7 @@ class HighScreeningPolicy:
         # Track which workers have been screened (per agent)
         self.screened_workers: Dict[str, set] = {}
 
-    def get_action(self, observation: np.ndarray, agent: str) -> int:
+    def get_action(self, observation, agent: str) -> int:
         """
         With some probability, interview an unscreened worker.
         Otherwise, use greedy policy.
@@ -231,7 +244,13 @@ class HighScreeningPolicy:
         if agent not in self.screened_workers:
             self.screened_workers[agent] = set()
 
-        parsed = self.greedy_policy._parse_observation(observation)
+        # Handle dict observation format
+        if isinstance(observation, dict):
+            obs_array = observation['observation']
+        else:
+            obs_array = observation
+
+        parsed = self.greedy_policy._parse_observation(obs_array)
 
         # Find unemployed workers who haven't been screened
         unemployed_unscreened = [
@@ -269,7 +288,7 @@ class NeverFirePolicy:
         )
         self.num_workers = num_workers
 
-    def get_action(self, observation: np.ndarray, agent: str) -> int:
+    def get_action(self, observation, agent: str) -> int:
         """Get action, but never fire."""
         action = self.greedy_policy.get_action(observation, agent)
 
@@ -311,7 +330,7 @@ class HeuristicPolicy:
             num_workers, num_companies, max_workers_per_company, ability_dim
         )
 
-    def get_action(self, observation: np.ndarray, agent: str) -> int:
+    def get_action(self, observation, agent: str) -> int:
         """
         Heuristic decision making.
 
@@ -321,7 +340,13 @@ class HeuristicPolicy:
         3. Hire if below target
         4. No-op
         """
-        parsed = self.greedy_policy._parse_observation(observation)
+        # Handle dict observation format
+        if isinstance(observation, dict):
+            obs_array = observation['observation']
+        else:
+            obs_array = observation
+
+        parsed = self.greedy_policy._parse_observation(obs_array)
 
         workforce_ids = [i for i in range(self.num_workers) if parsed['own_workforce'][i] > 0.5]
         workforce_size = len(workforce_ids)

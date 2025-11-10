@@ -30,7 +30,8 @@ pip install -r requirements.txt
 - numpy >= 1.20.0
 - gymnasium >= 0.28.0
 - pettingzoo >= 1.23.0
-- matplotlib >= 3.5.0 (optional, for visualization)
+- torch >= 2.0.0 (for PPO training)
+- tensorboard >= 2.10.0 (for experiment tracking and visualization)
 
 ## Quick Start
 
@@ -59,27 +60,56 @@ for _ in range(100):
 
 ## Training with PPO
 
-Train companies to learn optimal hiring policies using Independent PPO:
+Train companies to learn optimal hiring policies using Independent PPO (IPPO):
 
 ```bash
-# Train with default settings (100k steps, 3 companies, 10 workers)
+# Train with default settings (1M steps, 3 companies, 10 workers)
 python train_ppo.py
+
+# View training progress in TensorBoard
+tensorboard --logdir=runs
 ```
 
-See [TRAINING_GUIDE.md](TRAINING_GUIDE.md) for detailed training instructions.
+### PPO Features
+
+The PPO implementation includes CleanRL best practices:
+- **Action Masking**: Neural network masks invalid actions before sampling
+- **Orthogonal Initialization**: Better weight initialization for stability
+- **TensorBoard Logging**: Track episodic returns, losses, entropy, KL divergence
+- **Learning Rate Annealing**: Linear decay over training
+- **Explained Variance**: Monitor value function prediction quality
+- **Clipped Value Loss**: Prevent value function over-updating
+- **Unique Run IDs**: Each training run gets timestamped directory
+
+### Key Metrics to Monitor
+
+- **Episodic Returns**: Total reward per episode for each company
+- **Explained Variance**: >0.5 indicates good value function (higher is better)
+- **Entropy**: Should gradually decrease (exploration → exploitation)
+- **Approx KL**: Should stay <0.1 (policy update stability)
+- **Clip Fraction**: 0.1-0.3 indicates healthy PPO clipping
 
 ## Running Tests
 
 ```bash
+# Run PettingZoo compliance tests
+python tests/test_pettingzoo_compliance.py
+
 # Run basic verification tests
 python tests/test_simple.py
 
 # Compare baseline policies
 python tests/test_baseline_policies.py
-
-# Test PPO training
-python tests/test_ppo_training.py
 ```
+
+### PettingZoo Compliance
+
+The environment passes all official PettingZoo tests:
+- ✅ Parallel API compliance
+- ✅ Seed determinism
+- ✅ Action masking validation
+- ✅ Observation space consistency
+- ✅ Render functionality
 
 ## Environment Details
 
@@ -94,19 +124,29 @@ Companies can take four types of actions:
 
 Action encoding: `Discrete(1 + 3*N)` where N = number of workers
 
+**Action Masking**: Invalid actions are automatically masked:
+- FIRE: Only valid if worker is employed by this company
+- OFFER: Only valid if worker is unemployed AND company has capacity
+- INTERVIEW: Only valid if worker is unemployed
+- NO_OP: Always valid
+
 ### Observation Space
 
-Each company observes:
+Each company observes a dictionary containing:
 
-**Public Information**:
-- σ̂_j,t: Public ability signals for all workers
-- exp_j,t: Experience levels
-- τ_j,t: Tenure (time employed)
-- Employment status and current wages
+**Observation** (`Box`):
+- **Public Information**:
+  - σ̂_j,t: Public ability signals for all workers
+  - exp_j,t: Experience levels
+  - τ_j,t: Tenure (time employed)
+  - Employment status and current wages
+- **Private Information**:
+  - Belief about each worker's ability (mean and variance)
+  - Own workforce and profit
 
-**Private Information**:
-- Belief about each worker's ability (mean and variance)
-- Own workforce and profit
+**Action Mask** (`MultiBinary`):
+- Binary mask indicating valid actions (1) vs invalid actions (0)
+- Enables PPO agents to avoid invalid actions during training
 
 ### Reward Structure
 
@@ -162,29 +202,34 @@ Implements Gale-Shapley deferred acceptance for comparison with greedy matching.
 ```
 HireRL/
 ├── pettingzoo/
-│   ├── hirerl.py           # Main environment
+│   ├── hirerl.py           # Main environment (with action masking)
 │   ├── workers.py          # Worker pool management
-│   ├── screening.py        # Screening mechanism & beliefs
+│   ├── screening.py        # Screening mechanism & Bayesian beliefs
 │   ├── matching.py         # Stable matching algorithms
-│   ├── policies.py         # Baseline policies
+│   ├── policies.py         # Baseline policies (action masking compatible)
 │   └── utils.py            # Logging & visualization
 ├── tests/
-│   ├── test_simple.py           # Basic verification tests
-│   └── test_baseline_policies.py # Policy comparison
-├── requirements.txt
-└── README.md
+│   ├── test_pettingzoo_compliance.py  # PettingZoo API tests
+│   ├── test_simple.py                 # Basic verification
+│   └── test_baseline_policies.py      # Policy comparison
+├── train_ppo.py            # IPPO training with CleanRL best practices
+├── requirements.txt        # Dependencies (includes TensorBoard)
+├── README.md
+└── runs/                   # TensorBoard logs (generated)
 ```
 
 ## Baseline Policies
 
-Six baseline policies for testing:
+Six baseline policies for testing (all support action masking):
 
-1. **RandomPolicy**: Random action selection
-2. **GreedyPolicy**: Hire best available, fire worst
-3. **NoScreeningPolicy**: Greedy without interviews
-4. **HighScreeningPolicy**: Always screen before hiring
-5. **NeverFirePolicy**: Only hire, never fire
-6. **HeuristicPolicy**: Rule-based strategy
+1. **RandomPolicy**: Random action selection from valid actions only
+2. **GreedyPolicy**: Hire best available, fire worst performers
+3. **NoScreeningPolicy**: Greedy strategy without interviews
+4. **HighScreeningPolicy**: Always screen workers before hiring
+5. **NeverFirePolicy**: Only hire, never fire workers
+6. **HeuristicPolicy**: Rule-based strategy with screening threshold
+
+All policies automatically respect action masks and only select valid actions.
 
 ## Economic Concepts Implemented
 

@@ -278,7 +278,9 @@ class WorkerPool:
 
         # Profit depends on TRUE ability (which firms must infer)
         sigma_scalar = worker.sigma_true[0] if self.ability_dim == 1 else np.mean(worker.sigma_true)
-        profit = sigma_scalar + beta * np.log1p(worker.experience)
+        # Clamp experience to non-negative to avoid log1p issues
+        exp_clamped = max(0.0, worker.experience)
+        profit = sigma_scalar + beta * np.log1p(exp_clamped)
 
         return float(profit)
 

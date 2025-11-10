@@ -164,10 +164,12 @@ def verify_environment(env, num_steps: int = 10, verbose: bool = True):
     """
     Verify environment correctness.
 
-    Checks:
+    DEPRECATED: Use pettingzoo.test.parallel_api_test instead for comprehensive testing.
+
+    This function provides basic checks for:
     - Reset works
     - Step works with random actions
-    - Observations have correct shape
+    - Observations are in declared space
     - Rewards are numeric
     - Info dicts contain required keys
 
@@ -180,7 +182,7 @@ def verify_environment(env, num_steps: int = 10, verbose: bool = True):
         True if all checks pass, False otherwise
     """
     if verbose:
-        print("Verifying environment...")
+        print("Verifying environment (use pettingzoo.test.parallel_api_test for full compliance)...")
 
     try:
         # Test reset
@@ -189,17 +191,17 @@ def verify_environment(env, num_steps: int = 10, verbose: bool = True):
         if verbose:
             print("✓ Reset successful")
 
-        # Check observation shapes
+        # Check observations are in space
         for agent in env.agents:
-            obs_shape = observations[agent].shape
-            expected_shape = env.observation_space(agent).shape
+            obs = observations[agent]
+            expected_space = env.observation_space(agent)
 
-            if obs_shape != expected_shape:
-                print(f"✗ Observation shape mismatch for {agent}: {obs_shape} != {expected_shape}")
+            if not expected_space.contains(obs):
+                print(f"✗ Observation not in space for {agent}")
                 return False
 
         if verbose:
-            print(f"✓ Observation shapes correct: {expected_shape}")
+            print(f"✓ Observations in declared spaces")
 
         # Test steps with random actions
         for step in range(num_steps):
@@ -265,7 +267,13 @@ def print_environment_info(env):
     print(f"")
     print(f"Spaces:")
     print(f"  Action space size: {env.action_size}")
-    print(f"  Observation space shape: {env.observation_space(env.agents[0]).shape}")
+    obs_space = env.observation_space(env.agents[0])
+    if hasattr(obs_space, 'spaces'):  # Dict space
+        print(f"  Observation space: Dict with keys {list(obs_space.spaces.keys())}")
+        print(f"    - observation shape: {obs_space.spaces['observation'].shape}")
+        print(f"    - action_mask shape: {obs_space.spaces['action_mask'].shape}")
+    else:
+        print(f"  Observation space shape: {obs_space.shape}")
     print("="*60 + "\n")
 
 

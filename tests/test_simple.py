@@ -3,16 +3,17 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pettingzoo'))
 
 import numpy as np
+from pettingzoo.test import parallel_api_test
 
 from hirerl import JobMarketEnv
 from policies import RandomPolicy, GreedyPolicy
-from utils import verify_environment, print_environment_info, EpisodeLogger
+from utils import print_environment_info, EpisodeLogger
 
 
 def test_basic_functionality():
-    """Test basic environment functionality."""
+    """Test basic environment functionality using PettingZoo API test."""
     print("\n" + "="*60)
-    print("TEST 1: Basic Functionality")
+    print("TEST 1: Basic Functionality (PettingZoo API)")
     print("="*60)
 
     # Create simple environment
@@ -27,15 +28,17 @@ def test_basic_functionality():
     # Print configuration
     print_environment_info(env)
 
-    # Verify environment
-    success = verify_environment(env, num_steps=10, verbose=True)
-
-    if success:
-        print("\n✓ TEST 1 PASSED\n")
-    else:
-        print("\n✗ TEST 1 FAILED\n")
-
-    return success
+    # Use PettingZoo's official API test
+    try:
+        print("Running PettingZoo parallel API test...")
+        parallel_api_test(env, num_cycles=50)
+        print("\n✓ TEST 1 PASSED: Environment is PettingZoo compliant\n")
+        return True
+    except Exception as e:
+        print(f"\n✗ TEST 1 FAILED: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def test_random_policy():

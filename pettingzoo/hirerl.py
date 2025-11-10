@@ -27,7 +27,7 @@ where p_ij,t = σ_j + β*log(1 + exp_j,t) depends on TRUE ability (private info)
 
 import numpy as np
 import gymnasium as gym
-from gymnasium.spaces import Discrete, Box, Dict as GymDict, Tuple as GymTuple
+from gymnasium.spaces import Discrete, Box, Dict as GymDict, Tuple as GymTuple, MultiBinary
 from pettingzoo.utils.env import ParallelEnv
 from typing import Dict, List, Any, Tuple, Optional, Set
 from enum import IntEnum
@@ -88,6 +88,8 @@ class JobMarketEnv(ParallelEnv):
         worker_bargaining_power: float = 0.6,  # α in wage = α * expected_profit
         # Episode length
         max_timesteps: int = 100,
+        # Rendering
+        render_mode: Optional[str] = None,
         # Seed
         seed: Optional[int] = None
     ):
@@ -108,10 +110,12 @@ class JobMarketEnv(ParallelEnv):
             screening_c_max: Maximum meaningful screening cost
             worker_bargaining_power: Fraction of surplus captured by workers
             max_timesteps: Episode length
+            render_mode: Rendering mode ('human', 'rgb_array', or None)
             seed: Random seed
         """
         super().__init__()
 
+        self.render_mode = render_mode
         self.num_companies = num_companies
         self.num_workers = num_workers
         self.ability_dim = ability_dim
@@ -178,12 +182,15 @@ class JobMarketEnv(ParallelEnv):
         )
 
         self._observation_spaces = {
-            agent: Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(obs_size,),
-                dtype=np.float32
-            )
+            agent: GymDict({
+                'observation': Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(obs_size,),
+                    dtype=np.float32
+                ),
+                'action_mask': MultiBinary(self.action_size)
+            })
             for agent in self.agents
         }
 
@@ -224,7 +231,10 @@ class JobMarketEnv(ParallelEnv):
 
         # Reset state
         self.timestep = 0
-        self.company_profits = {agent: [0.0] for agent in self.agents}
+        self.company_profits = {agent: [0.0] for agent in self.possible_agents}
+
+        # Reset agents to all possible agents (alive at start of episode)
+        self.agents = self.possible_agents.copy()
 
         # Generate initial observations
         observations = {agent: self._get_obs(agent) for agent in self.agents}
@@ -232,7 +242,54 @@ class JobMarketEnv(ParallelEnv):
 
         return observations, infos
 
-    def _get_obs(self, agent: str) -> np.ndarray:
+    def _generate_action_mask(self, agent: str) -> np.ndarray:
+        """
+        Generate action mask for a specific agent.
+
+        Action validity rules:
+        - NO_OP (0): Always valid
+        - FIRE (1 to N): Valid only if worker is employed by this company
+        - OFFER (N+1 to 2N): Valid only if worker is unemployed AND company has capacity
+        - INTERVIEW (2N+1 to 3N): Valid only if worker is unemployed
+
+        Args:
+            agent: Company agent name
+
+        Returns:
+            Binary mask where 1 = valid action, 0 = invalid action
+        """
+        company_idx = int(agent.split("_")[1])
+        action_mask = np.zeros(self.action_size, dtype=np.int8)
+
+        # NO_OP is always valid
+        action_mask[0] = 1
+
+        # Check company capacity
+        current_workforce = len(self.worker_pool.get_employed_by_company(company_idx))
+        has_capacity = current_workforce < self.max_workers_per_company
+
+        # Process each worker
+        for worker_id in range(self.num_workers):
+            worker = self.worker_pool.workers[worker_id]
+
+            # FIRE action: valid only if worker is employed by this company
+            fire_action_id = 1 + worker_id
+            if worker.employed_by == company_idx:
+                action_mask[fire_action_id] = 1
+
+            # OFFER action: valid only if worker is unemployed AND company has capacity
+            offer_action_id = self.num_workers + 1 + worker_id
+            if worker.employed_by == -1 and has_capacity:
+                action_mask[offer_action_id] = 1
+
+            # INTERVIEW action: valid only if worker is unemployed
+            interview_action_id = 2 * self.num_workers + 1 + worker_id
+            if worker.employed_by == -1:
+                action_mask[interview_action_id] = 1
+
+        return action_mask
+
+    def _get_obs(self, agent: str) -> Dict[str, np.ndarray]:
         """
         Get observation for a specific agent.
 
@@ -240,6 +297,10 @@ class JobMarketEnv(ParallelEnv):
         - Public information (all workers)
         - Private beliefs (this firm's estimates of abilities)
         - Own workforce and profit
+        - Action mask indicating valid actions
+
+        Returns:
+            Dictionary with 'observation' and 'action_mask' keys
         """
         company_idx = int(agent.split("_")[1])
 
@@ -271,7 +332,13 @@ class JobMarketEnv(ParallelEnv):
             own_profit
         ])
 
-        return obs.astype(np.float32)
+        # Generate action mask
+        action_mask = self._generate_action_mask(agent)
+
+        return {
+            'observation': obs.astype(np.float32),
+            'action_mask': action_mask
+        }
 
     def _get_info(self, agent: str) -> Dict[str, Any]:
         """Get info dict for agent (debugging/logging info)."""
@@ -519,9 +586,15 @@ class JobMarketEnv(ParallelEnv):
         terminations = {agent: False for agent in self.agents}
         truncations = {agent: self.timestep >= self.max_timesteps for agent in self.agents}
 
+        # Remove done agents from self.agents (PettingZoo Parallel API requirement)
+        self.agents = [
+            agent for agent in self.agents
+            if not (terminations[agent] or truncations[agent])
+        ]
+
         return observations, rewards, terminations, truncations, infos
 
-    def render(self, mode="human"):
+    def render(self):
         """
         Render the current state.
 
@@ -531,14 +604,15 @@ class JobMarketEnv(ParallelEnv):
         - Average wage
         - Company workforces and profits
         """
-        if mode == "human":
+        if self.render_mode == "human":
             print(f"\n{'='*60}")
             print(f"Time Step: {self.timestep}/{self.max_timesteps}")
             print(f"Unemployment Rate: {self.worker_pool.get_unemployment_rate():.2%}")
             print(f"Average Wage: {self.worker_pool.get_average_wage():.2f}")
             print(f"{'='*60}")
 
-            for agent in self.agents:
+            # Use possible_agents instead of agents (agents may be empty after episode ends)
+            for agent in self.possible_agents:
                 company_idx = int(agent.split("_")[1])
                 workforce = self.worker_pool.get_employed_by_company(company_idx)
                 recent_profit = self.company_profits[agent][-1] if self.company_profits[agent] else 0.0
