@@ -78,7 +78,7 @@ class JobMarketEnv(ParallelEnv):
         g0: float = 0.1,     # Base experience growth
         g1: float = 0.05,    # Ability-dependent experience growth
         # Costs
-        base_firing_cost: float = 0.1,
+        base_firing_cost: float = 0.5, # firing cost should be >>> hiring cost
         base_hiring_cost: float = 0.2,
         base_screening_cost: float = 0.5,  # Default interview cost
         # Screening technology
