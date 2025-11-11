@@ -78,12 +78,12 @@ class JobMarketEnv(ParallelEnv):
         g0: float = 0.1,     # Base experience growth
         g1: float = 0.05,    # Ability-dependent experience growth
         # Costs
-        base_firing_cost: float = 0.5, # firing cost should be >>> hiring cost
-        base_hiring_cost: float = 0.2,
+        base_firing_cost: float = 0.9, # firing cost should be >>> hiring cost
+        #base_hiring_cost: float = 0.2, #为什么又要screen cost
         base_screening_cost: float = 0.5,  # Default interview cost
         # Screening technology
         screening_tech: ScreeningTechnology = ScreeningTechnology.SQRT,
-        screening_c_max: float = 1.0,
+        screening_c_max: float = 0.85,
         # Wage parameters
         worker_bargaining_power: float = 0.6,  # α in wage = α * expected_profit
         # Episode length
@@ -104,7 +104,7 @@ class JobMarketEnv(ParallelEnv):
             gamma: Public signal growth rate with tenure
             g0, g1: Experience accumulation parameters
             base_firing_cost: Cost to fire a worker
-            base_hiring_cost: Cost to hire a worker (onboarding, etc.)
+            #base_hiring_cost: Cost to hire a worker (onboarding, etc.)
             base_screening_cost: Default interview/screening cost
             screening_tech: Screening technology type
             screening_c_max: Maximum meaningful screening cost
