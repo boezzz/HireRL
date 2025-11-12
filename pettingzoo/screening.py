@@ -13,7 +13,7 @@ from enum import Enum
 
 
 class ScreeningTechnology(Enum):
-    """Different screening technology specifications."""
+    """[DEPRECATED] Legacy precision(c) forms kept for backward compatibility."""
     LINEAR = "linear"           # precision(c) = min(c / c_max, 1)
     LOGARITHMIC = "log"         # precision(c) = log(1 + c) / log(1 + c_max)
     SQRT = "sqrt"               # precision(c) = sqrt(c / c_max)
@@ -33,7 +33,9 @@ class ScreeningMechanism:
         technology: ScreeningTechnology = ScreeningTechnology.SQRT,
         c_max: float = 1.0,  # Maximum meaningful cost
         noise_std: float = 0.2,  # Residual noise even with perfect screening
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        delta0_sq: float = 1.0,   # Interview noise at zero cost: δ0^2
+        lam: float = 1.0          # Cost–precision decay parameter λ
     ):
         """
         Initialize screening mechanism.
@@ -48,9 +50,12 @@ class ScreeningMechanism:
         self.c_max = c_max
         self.noise_std = noise_std
         self.rng = np.random.RandomState(seed)
+        self.delta0_sq = float(delta0_sq) # Interview noise at zero cost: δ0^2
+        self.lam = float(lam) # Cost–precision decay parameter λ
 
     def get_precision(self, cost: float) -> float:
         """
+        [DEPRECATED] Prefer using interview_var(cost) which implements δ²(c) from the paper.
         Compute precision level for a given screening cost.
 
         Precision ∈ [0, 1] determines how much of the gap between public signal
@@ -93,72 +98,31 @@ class ScreeningMechanism:
 
         return float(np.clip(precision, 0.0, 1.0))
 
+    def interview_var(self, cost: float) -> float:
+        """
+        Interview signal variance per the paper:
+            δ^2(c) = δ0^2 * exp(-λ c)
+        """
+        c = max(0.01, float(cost))
+        return float(self.delta0_sq * np.exp(-self.lam * c))
+
     def screen_worker(
         self,
         sigma_true: np.ndarray,
         sigma_hat_0: np.ndarray,
         cost: float
     ) -> Tuple[np.ndarray, float]:
-        """
-        Perform screening/interview on a worker.
+        # Use paper-consistent private interview signal:
+        # \tilde{σ}_{ij,t} = σ_j + η,  η ~ N(0, δ^2(c)) where δ^2(c) = δ0^2 * exp(-λ c)
+        var = self.interview_var(cost)
+        std = np.sqrt(var)
+        noise = self.rng.randn(*sigma_true.shape).astype(np.float32) * std
+        tilde_sigma = sigma_true + noise
+        # Optional precision metric for logging/analysis: 1 - Var/Var0 ∈ [0,1]
+        precision = float(1.0 - var / self.delta0_sq) if self.delta0_sq > 0 else 0.0
+        return tilde_sigma, precision
 
-        Returns noisy estimate of true ability based on screening investment.
 
-        Formula:
-            σ_estimate = σ̂_0 + precision(c) * (σ_true - σ̂_0) + ε
-        where:
-            - σ̂_0 is the public signal (free information)
-            - (σ_true - σ̂_0) is the hidden information gap
-            - precision(c) determines how much of the gap is revealed
-            - ε ~ N(0, noise_std²) is residual measurement error
-
-        Args:
-            sigma_true: Worker's true ability (private info)
-            sigma_hat_0: Public signal (from resume)
-            cost: Screening cost to invest
-
-        Returns:
-            Tuple of (estimated_ability, precision_achieved)
-        """
-        precision = self.get_precision(cost)
-
-        # Reveal fraction of hidden information based on precision
-        information_gap = sigma_true - sigma_hat_0
-        revealed_info = precision * information_gap
-
-        # Add measurement noise (screening isn't perfect)
-        noise = self.rng.randn(*sigma_true.shape).astype(np.float32) * self.noise_std
-
-        # Final estimate
-        sigma_estimate = sigma_hat_0 + revealed_info + noise
-
-        return sigma_estimate, precision
-
-    def get_expected_variance(self, cost: float, sigma_variance: float = 1.0) -> float:
-        """
-        Compute expected variance of estimate given screening cost.
-
-        Useful for firms to decide optimal screening investment.
-
-        The variance of the estimate is:
-            Var[σ_estimate] = (1 - precision)² * Var[σ_true] + noise_std²
-
-        Args:
-            cost: Screening cost
-            sigma_variance: Variance of true ability distribution
-
-        Returns:
-            Expected variance of ability estimate
-        """
-        precision = self.get_precision(cost)
-
-        # Variance from unrevealed information
-        unrevealed_var = (1 - precision) ** 2 * sigma_variance
-
-        # Variance from measurement noise
-        noise_var = self.noise_std ** 2
-
-        return unrevealed_var + noise_var
 
     # def optimal_screening_cost(
     #     self,
@@ -273,7 +237,7 @@ class FirmBeliefs:
             screening_mechanism: Screening mechanism (to get precision/variance)
         """
         # Get variance of screening signal
-        signal_var = screening_mechanism.get_expected_variance(screening_cost)
+        signal_var = screening_mechanism.interview_var(screening_cost)
 
         # Current belief
         prior_mean = self.belief_mean[worker_id]
@@ -281,53 +245,44 @@ class FirmBeliefs:
 
         # Bayesian update
         posterior_var = (prior_var * signal_var) / (prior_var + signal_var)
-        posterior_mean = (prior_mean * signal_var + sigma_estimate * prior_var) / (prior_var + signal_var)
+        posterior_mean = (prior_mean * signal_var + sigma_estimate * prior_var) / (prior_var + signal_var) ####??
 
         self.belief_mean[worker_id] = posterior_mean
         self.belief_var[worker_id] = posterior_var
 
+    def interview_and_update(self,
+                             worker_id: int,
+                             sigma_true: np.ndarray,
+                             sigma_hat_0: np.ndarray,
+                             cost: float,
+                             screening_mechanism: ScreeningMechanism) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray]:
+        """
+        Convenience pipeline: generate a private interview signal and immediately update beliefs.
+        Returns (tilde_sigma, precision, posterior_mean, posterior_var).
+        """
+        tilde_sigma, precision = screening_mechanism.screen_worker(sigma_true, sigma_hat_0, cost)
+        self.update_from_screening(worker_id, tilde_sigma, cost, screening_mechanism)
+        return tilde_sigma, precision, self.belief_mean[worker_id].copy(), self.belief_var[worker_id].copy()
+
     def update_from_performance(
         self,
         worker_id: int,
-        observed_profit: float,
-        worker_experience: float,
-        profit_noise_var: float = 0.1
+        p_ijt: float,
+        exp_t: float,
+        tilde_sigma_interview: float,
+        delta_interview_sq: float,
+        delta_eps_sq: float,
     ):
         """
-        Update beliefs from observed performance (employer learning).
-
-        Observation: profit = σ_j + β*log(1 + exp_j) + ε
-
-        We infer σ_j from profit by subtracting experience component.
-
-        Args:
-            worker_id: Worker whose performance is observed
-            observed_profit: Realized profit p_ij,t
-            worker_experience: Worker's experience level exp_j,t
-            profit_noise_var: Variance of profit noise
+        [DEPRECATED signature change in progress] Paper-consistent update.
+        This forwards to `update_from_performance_convex` to keep a single source of truth.
         """
-        beta = 0.5  # Experience return parameter (should match worker_pool)
-
-        # Infer ability signal from performance
-        # profit = σ + β*log(1+exp) + ε
-        # => σ_implied = profit - β*log(1+exp)
-        # Clamp experience to non-negative
-        exp_clamped = max(0.0, worker_experience)
-        experience_component = beta * np.log1p(exp_clamped)
-        sigma_implied = observed_profit - experience_component
-
-        # Treat as noisy signal of true ability
-        signal_var = profit_noise_var
-
-        # Bayesian update (same as screening)
-        prior_mean = self.belief_mean[worker_id, 0]  # Assuming ability_dim=1
-        prior_var = self.belief_var[worker_id, 0]
-
-        posterior_var = (prior_var * signal_var) / (prior_var + signal_var)
-        posterior_mean = (prior_mean * signal_var + sigma_implied * prior_var) / (prior_var + signal_var)
-
-        self.belief_mean[worker_id, 0] = posterior_mean
-        self.belief_var[worker_id, 0] = posterior_var
+        self.update_from_performance_convex(worker_id,
+                                            p_ijt=p_ijt,
+                                            tilde_sigma_interview=tilde_sigma_interview,
+                                            exp_t=exp_t,
+                                            delta_interview_sq=delta_interview_sq,
+                                            delta_eps_sq=delta_eps_sq)
 
     def get_belief(self, worker_id: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -338,22 +293,158 @@ class FirmBeliefs:
         """
         return self.belief_mean[worker_id], self.belief_var[worker_id]
 
-    def get_expected_profit(self, worker_id: int, experience: float, beta: float = 0.5) -> float:
+    def get_expected_profit(self, worker_id: int, exp_tm1: float,
+                            g0: float = 0.1, g1: float = 0.5, theta: float = 0.05,
+                            f_type: str = 'linear') -> float:
         """
-        Compute expected profit given current beliefs.
-
-        E[profit | beliefs] = E[σ_j | beliefs] + β*log(1 + exp_j)
-
-        Args:
-            worker_id: Worker ID
-            experience: Worker's current experience
-            beta: Experience return parameter
-
-        Returns:
-            Expected profit
+        Expected profit under current belief mean, following the paper's structure (without noise):
+            E[p_{ij,t}] = f[ exp_{j,t-1} + (g0 + g1 * E[σ_j]) * exp(-θ * exp_{j,t-1}) ]
         """
-        mean_ability = self.belief_mean[worker_id, 0]  # Assuming ability_dim=1
-        # Clamp experience to non-negative
-        exp_clamped = max(0.0, experience)
-        experience_value = beta * np.log1p(exp_clamped)
-        return float(mean_ability + experience_value)
+        mean_ability = float(self.belief_mean[worker_id, 0])
+        core = float(exp_tm1) + (g0 + g1 * mean_ability) * np.exp(-theta * float(exp_tm1))
+        if f_type == 'linear':
+            val = core
+        elif f_type == 'log':
+            val = np.log1p(core)
+        elif f_type == 'diminishing':
+            val = core / (1.0 + 0.1 * core)
+        else:
+            raise ValueError(f"Unknown profit function type: {f_type}")
+        return float(val)
+
+    def public_signal_next(self, sigma_hat_t: np.ndarray, employed: bool, gamma: float) -> np.ndarray:
+        """
+        Deterministic public-signal drift with tenure (per paper):
+            \hat{σ}_{j,t+1} = \hat{σ}_{j,t} + γ·1{employed at t}
+        """
+        return sigma_hat_t + (gamma if employed else 0.0)
+
+    def update_from_performance_convex(self,
+                                       worker_id: int,
+                                       p_ijt: float,
+                                       tilde_sigma_interview: float,
+                                       exp_t: float,
+                                       delta_interview_sq: float,
+                                       delta_eps_sq: float):
+        """
+        Paper-style convex combination update:
+            \tilde{σ}_{t+1} = (1 - v_x)\,\tilde{σ}_{interview} + v_x\, p_{ij,t}
+        with v_x = (exp * K1) / (1 + (exp - 1) * K1),  K1 = δ_interview^2 / (δ_interview^2 + δ_ε^2).
+        This method stores the new score in belief_mean[worker_id, 0].
+        """
+        exp_clamped = max(0.0, float(exp_t))
+        K1 = float(delta_interview_sq) / float(delta_interview_sq + delta_eps_sq) if (delta_interview_sq + delta_eps_sq) > 0 else 0.0
+        vx = (exp_clamped * K1) / (1.0 + (exp_clamped - 1.0) * K1) if K1 > 0 else 0.0
+        new_score = (1.0 - vx) * float(tilde_sigma_interview) + vx * float(p_ijt)
+        self.belief_mean[worker_id, 0] = new_score
+
+
+# ===============================================================
+# Profit Function Definitions (Following Schönberg & Farber setup)
+# ===============================================================
+
+def generate_profit(exp_tm1: float,
+                    sigma_j: float,
+                    employed_tm1: bool,
+                    g0: float = 0.1,
+                    g1: float = 0.5,
+                    theta: float = 0.05,
+                    delta_eps_sq: float = 0.1,
+                    f_type: str = 'linear',
+                    rng: Optional[np.random.RandomState] = None) -> float:
+    """
+    Generate realized profit p_{ij,t} following the paper's structure:
+
+        p_{ij,t} = f[ exp_{j,t-1} + (g0 + g1*sigma_j)*1{employed}*exp(-theta*exp_{j,t-1}) ] + epsilon
+
+    where epsilon ~ N(0, delta_eps_sq).
+
+    Args:
+        exp_tm1: Experience level at t-1
+        sigma_j: True ability of the worker
+        employed_tm1: Whether the worker was employed at t-1
+        g0, g1, theta: Parameters controlling experience and ability contributions
+        delta_eps_sq: Variance of performance noise ε
+        f_type: Form of profit function ('linear', 'log', 'diminishing')
+        rng: Optional RNG for reproducibility
+
+    Returns:
+        Realized profit value p_{ij,t}.
+    """
+    if rng is None:
+        rng = np.random
+
+    # Core deterministic term
+    core = exp_tm1 + (g0 + g1 * sigma_j) * (1.0 if employed_tm1 else 0.0) * np.exp(-theta * exp_tm1)
+
+    # Select profit function form f(x)
+    if f_type == 'linear':
+        val = core  # Linear production: f(x) = x
+    elif f_type == 'log':
+        val = np.log1p(core)  # Concave returns: f(x) = log(1+x)
+    elif f_type == 'diminishing':
+        val = core / (1.0 + 0.1 * core)  # Diminishing marginal returns
+    else:
+        raise ValueError(f"Unknown profit function type: {f_type}")
+
+    # Add random noise ε ~ N(0, δ_ε²)
+    eps = rng.normal(0.0, np.sqrt(delta_eps_sq))
+    return float(val + eps)
+
+
+class ProfitFunctionExamples:
+    """Convenience access to example profit functions used in calibration or testing."""
+
+    @staticmethod
+    def linear(x: float) -> float:
+        return x
+
+    @staticmethod
+    def log(x: float) -> float:
+        return np.log1p(x)
+
+    @staticmethod
+    def diminishing(x: float) -> float:
+        return x / (1.0 + 0.1 * x)
+
+
+# ===============================================================
+# Experience Accumulation (per paper)
+# ===============================================================
+def update_experience(exp_t: float,
+                      sigma_j: float,
+                      employed_t: bool,
+                      g0: float,
+                      g1: float,
+                      theta: float) -> float:
+    """
+    Deterministic on-the-job experience accumulation:
+        exp_{t+1} = exp_t + (g0 + g1*sigma_j) * 1{employed at t} * exp(-theta * exp_t)
+    with exp_t >= 0 and theta > 0.
+    """
+    exp_t = max(0.0, float(exp_t))
+    theta = float(theta)
+    if theta <= 0:
+        raise ValueError("theta must be > 0")
+    increment = (g0 + g1 * sigma_j) * (1.0 if employed_t else 0.0) * np.exp(-theta * exp_t)
+    return float(exp_t + increment)
+
+def update_experience_vec(exp_t: np.ndarray,
+                          sigma_j: np.ndarray,
+                          employed_t: np.ndarray,
+                          g0: float,
+                          g1: float,
+                          theta: float) -> np.ndarray:
+    """
+    Vectorized version for batch updates over workers.
+    Shapes:
+      - exp_t: (N,)
+      - sigma_j: (N,)
+      - employed_t: (N,) boolean or {0,1}
+    """
+    exp_t = np.maximum(0.0, exp_t.astype(float))
+    if theta <= 0:
+        raise ValueError("theta must be > 0")
+    employed_float = employed_t.astype(float)
+    increment = (g0 + g1 * sigma_j) * employed_float * np.exp(-theta * exp_t)
+    return (exp_t + increment).astype(float)

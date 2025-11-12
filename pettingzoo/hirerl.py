@@ -85,7 +85,7 @@ class JobMarketEnv(ParallelEnv):
         screening_tech: ScreeningTechnology = ScreeningTechnology.SQRT,
         screening_c_max: float = 0.85,
         # Wage parameters
-        worker_bargaining_power: float = 0.6,  # α in wage = α * expected_profit
+        worker_bargaining_power: float = 0.6,  #  lambda as in paper ; α in wage = α * expected_profit
         # Episode length
         max_timesteps: int = 100,
         # Rendering
@@ -126,10 +126,10 @@ class JobMarketEnv(ParallelEnv):
         self.g1 = g1
 
         self.base_firing_cost = base_firing_cost
-        self.base_hiring_cost = base_hiring_cost
+       # self.base_hiring_cost = base_hiring_cost
         self.base_screening_cost = base_screening_cost
 
-        self.worker_bargaining_power = worker_bargaining_power
+        self.worker_bargaining_power = worker_bargaining_power # lambda in the paper
         self.max_timesteps = max_timesteps
 
         # Initialize worker pool
@@ -175,7 +175,7 @@ class JobMarketEnv(ParallelEnv):
             num_workers +                 # tenure
             num_workers +                 # employed_by
             num_workers +                 # wages
-            num_workers * ability_dim +  # belief_mean
+            num_workers * ability_dim +  # belief_mean 检查一下这是不是私有评估
             num_workers * ability_dim +  # belief_var
             num_workers +                 # own_workforce (binary)
             1                             # own_profit
@@ -226,7 +226,7 @@ class JobMarketEnv(ParallelEnv):
         for agent in self.agents:
             self.firm_beliefs[agent].initialize_from_public_signals(
                 public_state['sigma_hat'],
-                signal_noise_var=0.25
+                signal_noise_var=0.25 # public signal也要variance吗。
             )
 
         # Reset state
@@ -347,7 +347,7 @@ class JobMarketEnv(ParallelEnv):
 
         return {
             'workforce_size': len(workforce),
-            'total_profit': sum(self.company_profits[agent]),
+            'total_profit': sum(self.company_profits[agent]), #这是每个公司的还是所有公司加起来的啊？
             'unemployment_rate': self.worker_pool.get_unemployment_rate(),
             'avg_wage': self.worker_pool.get_average_wage(),
             'timestep': self.timestep
@@ -376,13 +376,13 @@ class JobMarketEnv(ParallelEnv):
             # Offer action (with computed wage)
             worker_id = action - self.num_workers - 1
             # Compute wage based on beliefs and bargaining power
-            wage = self._compute_wage_offer(agent, worker_id)
+            wage = self._compute_wage_offer(agent, worker_id) #等会看一下工资的决定公式
             return ('offer', worker_id, wage)
 
         elif 2 * self.num_workers + 1 <= action <= 3 * self.num_workers:
             # Interview action (with default cost)
             worker_id = action - 2 * self.num_workers - 1
-            cost = self.base_screening_cost
+            cost = self.base_screening_cost #成本不能是线性固定的吧。。。这是最重要决定结果的东西吧。。。。
             return ('interview', worker_id, cost)
 
         else:
@@ -393,8 +393,17 @@ class JobMarketEnv(ParallelEnv):
         """
         Compute wage offer based on firm's beliefs and worker bargaining power.
 
-        Wage = α * E[profit | beliefs]
-             = α * (E[σ_j | beliefs] + β*log(1 + exp_j))
+        w_{j,t} = (1-v_x)\hat\sigma_{j,0} + v_x \lambda  p_{ij,t} \\
+      = (1-v_x)\hat\sigma_{j,0} + \lambda f \Bigl[
+    \exp_{j,t-1}
+    +  \\
+    (g_0 + g_1\sigma_j)
+    \mathbf{1}\{ j \text{ employed at } t-1 \}
+    e^{-\theta \exp_{j,t-1}}+ \epsilon_{ij,t}
+\Bigr ] \\
+ \quad \epsilon_{ij,t} \sim \mathcal{N}(0, \delta_\epsilon^2) \quad \lambda \in (0,1) \quad \theta>0
+
+ 总之这边都是错的。。。
 
         Args:
             agent: Company agent
@@ -410,7 +419,7 @@ class JobMarketEnv(ParallelEnv):
             worker_id,
             worker.experience,
             beta=0.5
-        )
+        ) #更新belief
 
         wage = self.worker_bargaining_power * expected_profit
 
