@@ -265,7 +265,7 @@ class WorkerPool:
         - True ability σ_j determines base productivity
         - Experience has diminishing returns (log function)
         - Profit depends on TRUE ability (private info), not public signal
-
+###这里都还是错的。。
         Args:
             worker_id: Worker index
             company_id: Company index (unused for now, could add match-specific effects)

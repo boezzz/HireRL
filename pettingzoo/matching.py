@@ -1,385 +1,108 @@
-"""
-1. Greedy Matching: Firms make offers, workers accept highest wage (MARL approach)
-2. Stable Matching: Deferred acceptance algorithm (Gale-Shapley)
-
-A matching is STABLE if:
-1. Individual Rationality: No firm or worker prefers unemployment to their match
-2. No Blocking Pairs: No (firm, worker) pair would both prefer to match with each other
-"""
-
-import numpy as np
-from typing import Dict, List, Tuple, Set, Optional
 from dataclasses import dataclass
+from typing import Dict, Optional, List, Callable
+import numpy as np
 
 
 @dataclass
-class MatchingOutcome:
+class WageMatchingResult:
     """
-    Result of a matching mechanism.
-
-    Attributes:
-        matches: Dict mapping company_id -> set of worker_ids
-        wages: Dict mapping worker_id -> wage
-        unmatched_workers: Set of worker IDs not matched
-        unmatched_companies: Set of company IDs not matched
-        is_stable: Whether matching is stable
-        time_to_match: Time periods needed to find matching
+    一步静态匹配结果（面试后、尚未产生 profit）：
+      - 每个 firm 最多雇一个 worker
+      - 工资只取决于面试信号 w_{ij} = (1 - v_x) g(tilde_sigma_{ij})
     """
-    matches: Dict[int, Set[int]]
-    wages: Dict[int, float]
-    unmatched_workers: Set[int]
-    unmatched_companies: Set[int]
-    is_stable: bool
-    time_to_match: int
+    firm_to_worker: Dict[int, Optional[int]]   # firm i -> worker j or None
+    worker_to_firm: Dict[int, Optional[int]]   # worker j -> firm i or None
+    worker_wage: Dict[int, float]              # worker j -> accepted wage
 
 
-class StableMatching:
+def greedy_wage_matching_from_signals(
+    tilde_sigma: np.ndarray,
+    v_x: float,
+    g: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    eligible_workers: Optional[List[int]] = None,
+) -> WageMatchingResult:
     """
-    Implements stable matching algorithms for labor markets.
+    3. Firms give the offer to the highest ability worker based on the
+       updated tilde_sigma_{ij,t} and offer a wage:
 
-    Based on Gale-Shapley deferred acceptance algorithm, extended to handle:
-    - Many-to-one matching (firms can hire multiple workers)
-    - Wage determination
-    - Beliefs about worker ability
+           w_{j,t} = (1 - v_x) g(tilde_sigma_{ij,t=interview})
+
+       Workers are perfectly greedy and accept the highest wage.
+
+    参数
+    ----
+    tilde_sigma : np.ndarray
+        形状为 (num_firms, num_workers)，
+        tilde_sigma[i, j] 是 firm i 对 worker j 的面试信号。
+    v_x : float
+        权重 v_x ∈ [0, 1)，此处还未用到 profit，因此只出现 (1 - v_x)。
+    g : callable, optional
+        对面试信号做变换的函数 g(x)。若为 None，则 g(x) = x。
+    eligible_workers : list[int], optional
+        可以被雇佣的 worker 下标集合；若为 None，则所有 worker 均可。
+
+    返回
+    ----
+    WageMatchingResult
     """
+    tilde_sigma = np.asarray(tilde_sigma, dtype=float)
+    if tilde_sigma.ndim != 2:
+        raise ValueError("tilde_sigma must be a 2D array (num_firms, num_workers).")
 
-    def __init__(self, num_companies: int, num_workers: int):
-        """
-        Initialize stable matching mechanism.
+    num_firms, num_workers = tilde_sigma.shape
 
-        Args:
-            num_companies: Number of firms
-            num_workers: Number of workers
-        """
-        self.num_companies = num_companies
-        self.num_workers = num_workers
+    if eligible_workers is None:
+        eligible_workers = list(range(num_workers))
+    else:
+        eligible_workers = list(eligible_workers)
 
-    def compute_firm_preferences(
-        self,
-        company_id: int,
-        worker_beliefs: np.ndarray,  # Expected ability for each worker
-        worker_experience: np.ndarray,
-        unemployed_workers: List[int]
-    ) -> List[int]:
-        """
-        Compute firm's preference ranking over workers.
+    # 默认 g(x) 为有天花板、递减边际回报的单调函数：
+    # g(x) = 0.5 * (1 + tanh(alpha * x)) ∈ (0, 1)，能力越高，工资信号越高，但逐渐趋于上界
+    if g is None:
+        def g(x: np.ndarray) -> np.ndarray:
+            alpha = 0.5
+            return 0.5 * (1.0 + np.tanh(alpha * x))
 
-        Firms prefer workers with higher expected profit:
-            E[profit] = E[σ_j | beliefs] + β*log(1 + exp_j)
+    # 计算工资矩阵 w_{ij} = (1 - v_x) * g(tilde_sigma_{ij})
+    g_tilde = g(tilde_sigma)
+    wages_ij = (1.0 - float(v_x)) * g_tilde
 
-        Args:
-            company_id: Company index
-            worker_beliefs: Firm's belief about each worker's ability (num_workers,)
-            worker_experience: Experience levels (num_workers,)
-            unemployed_workers: List of available worker IDs
+    firm_to_worker: Dict[int, Optional[int]] = {i: None for i in range(num_firms)}
+    worker_to_firm: Dict[int, Optional[int]] = {j: None for j in range(num_workers)}
+    worker_wage: Dict[int, float] = {}
 
-        Returns:
-            List of worker IDs sorted by preference (most preferred first)
-        """
-        beta = 0.5  # Experience return parameter
+    # 每个 firm：挑一个工资最高的 worker 发 offer
+    offers_by_worker: Dict[int, List[tuple[int, float]]] = {j: [] for j in eligible_workers}
 
-        # Compute expected profit for each unemployed worker
-        expected_profits = []
-        for worker_id in unemployed_workers:
-            exp_profit = worker_beliefs[worker_id] + beta * np.log1p(worker_experience[worker_id])
-            expected_profits.append((exp_profit, worker_id))
+    for i in range(num_firms):
+        best_j = None
+        best_wage = -np.inf
+        for j in eligible_workers:
+            w_ij = wages_ij[i, j]
+            if w_ij > best_wage:
+                best_wage = w_ij
+                best_j = j
 
-        # Sort by expected profit (descending)
-        expected_profits.sort(reverse=True, key=lambda x: x[0])
+        if best_j is not None and np.isfinite(best_wage):
+            offers_by_worker[best_j].append((i, float(best_wage)))
 
-        return [worker_id for _, worker_id in expected_profits]
+    # Workers 完全贪心：接受最高工资
+    for j in eligible_workers:
+        if not offers_by_worker[j]:
+            continue
 
-    def compute_worker_preferences(
-        self,
-        worker_id: int,
-        wage_offers: Dict[int, float]  # company_id -> wage
-    ) -> List[int]:
-        """
-        Compute worker's preference ranking over firms.
-
-        Workers prefer higher wages (perfectly greedy).
-
-        Args:
-            worker_id: Worker index
-            wage_offers: Map of company_id -> wage offer
-
-        Returns:
-            List of company IDs sorted by preference (most preferred first)
-        """
-        # Sort companies by wage (descending)
-        sorted_companies = sorted(wage_offers.items(), key=lambda x: x[1], reverse=True)
-        return [company_id for company_id, _ in sorted_companies]
-
-    def deferred_acceptance(
-        self,
-        firm_preferences: Dict[int, List[int]],  # company_id -> ranked list of workers
-        worker_preferences: Dict[int, List[int]],  # worker_id -> ranked list of companies
-        firm_capacities: Dict[int, int],  # company_id -> max workers
-        wage_offers: Dict[Tuple[int, int], float]  # (company_id, worker_id) -> wage
-    ) -> MatchingOutcome:
-        """
-        Firm-proposing deferred acceptance algorithm.
-
-        Algorithm:
-        1. Each firm proposes to its most preferred available worker
-        2. Each worker tentatively accepts best offer, rejects others
-        3. Rejected firms propose to next worker on their list
-        4. Repeat until no firm wants to make new proposals
-
-        Args:
-            firm_preferences: Each firm's ranked list of workers
-            worker_preferences: Each worker's ranked list of firms
-            firm_capacities: Maximum workers per firm
-            wage_offers: Wage that each firm offers to each worker
-
-        Returns:
-            MatchingOutcome with stable matching
-        """
-        # Track current tentative matches
-        worker_to_firm: Dict[int, int] = {}  # worker -> current tentative firm
-        firm_to_workers: Dict[int, Set[int]] = {c: set() for c in range(self.num_companies)}
-
-        # Track which workers each firm has already proposed to
-        proposed_to: Dict[int, Set[int]] = {c: set() for c in range(self.num_companies)}
-
-        # Firms that still want to make proposals
-        active_firms = set(range(self.num_companies))
-
-        iterations = 0
-        max_iterations = self.num_companies * self.num_workers  # Prevent infinite loops
-
-        while active_firms and iterations < max_iterations:
-            iterations += 1
-            firms_to_deactivate = set()
-
-            for company_id in list(active_firms):
-                # Check if firm has capacity
-                if len(firm_to_workers[company_id]) >= firm_capacities[company_id]:
-                    firms_to_deactivate.add(company_id)
-                    continue
-
-                # Get firm's preference list
-                pref_list = firm_preferences.get(company_id, [])
-
-                # Find next worker to propose to (not yet proposed)
-                next_worker = None
-                for worker_id in pref_list:
-                    if worker_id not in proposed_to[company_id]:
-                        next_worker = worker_id
-                        break
-
-                if next_worker is None:
-                    # Firm has proposed to all workers on its list
-                    firms_to_deactivate.add(company_id)
-                    continue
-
-                # Make proposal
-                proposed_to[company_id].add(next_worker)
-                worker_id = next_worker
-
-                # Worker evaluates proposal
-                current_firm = worker_to_firm.get(worker_id, None)
-
-                if current_firm is None:
-                    # Worker is unmatched, accept proposal
-                    worker_to_firm[worker_id] = company_id
-                    firm_to_workers[company_id].add(worker_id)
-                else:
-                    # Worker compares current match with new proposal
-                    current_wage = wage_offers.get((current_firm, worker_id), 0.0)
-                    new_wage = wage_offers.get((company_id, worker_id), 0.0)
-
-                    if new_wage > current_wage:
-                        # Accept new offer, reject current
-                        firm_to_workers[current_firm].remove(worker_id)
-                        worker_to_firm[worker_id] = company_id
-                        firm_to_workers[company_id].add(worker_id)
-
-                        # Current firm becomes active again (lost a worker)
-                        active_firms.add(current_firm)
-                    # else: reject new offer, keep current
-
-            # Deactivate firms that can't make more proposals
-            active_firms -= firms_to_deactivate
-
-        # Extract final matching
-        final_wages = {
-            worker_id: wage_offers.get((company_id, worker_id), 0.0)
-            for worker_id, company_id in worker_to_firm.items()
-        }
-
-        matched_workers = set(worker_to_firm.keys())
-        unmatched_workers = set(range(self.num_workers)) - matched_workers
-
-        matched_companies = set(c for c in range(self.num_companies) if firm_to_workers[c])
-        unmatched_companies = set(range(self.num_companies)) - matched_companies
-
-        # Check stability
-        is_stable = self._check_stability(
-            firm_to_workers, worker_to_firm, firm_preferences,
-            worker_preferences, wage_offers
+        # 按工资排序；工资相同则 firm id 小的胜出
+        best_i, best_wage = max(
+            offers_by_worker[j],
+            key=lambda pair: (pair[1], -pair[0])
         )
 
-        return MatchingOutcome(
-            matches=firm_to_workers,
-            wages=final_wages,
-            unmatched_workers=unmatched_workers,
-            unmatched_companies=unmatched_companies,
-            is_stable=is_stable,
-            time_to_match=iterations
-        )
+        firm_to_worker[best_i] = j
+        worker_to_firm[j] = best_i
+        worker_wage[j] = best_wage
 
-    def _check_stability(
-        self,
-        firm_to_workers: Dict[int, Set[int]],
-        worker_to_firm: Dict[int, int],
-        firm_preferences: Dict[int, List[int]],
-        worker_preferences: Dict[int, List[int]],
-        wage_offers: Dict[Tuple[int, int], float]
-    ) -> bool:
-        """
-        Check if matching is stable.
-
-        A matching is stable if there are no blocking pairs:
-        - Firm i and worker j form a blocking pair if:
-          1. They are not currently matched
-          2. Firm i prefers worker j to some current employee (or has capacity)
-          3. Worker j prefers firm i to current employer (or is unemployed)
-
-        Args:
-            firm_to_workers: Current matching (firm -> workers)
-            worker_to_firm: Current matching (worker -> firm)
-            firm_preferences: Firm preference rankings
-            worker_preferences: Worker preference rankings
-            wage_offers: Wage structure
-
-        Returns:
-            True if matching is stable
-        """
-        # Check each potential (firm, worker) pair
-        for company_id in range(self.num_companies):
-            for worker_id in range(self.num_workers):
-                # Skip if already matched
-                if worker_id in firm_to_workers[company_id]:
-                    continue
-
-                # Check if firm prefers this worker to some current employee
-                current_workers = firm_to_workers[company_id]
-                if not current_workers:
-                    firm_prefers = True  # Firm has capacity
-                else:
-                    firm_pref_list = firm_preferences.get(company_id, [])
-                    if worker_id not in firm_pref_list:
-                        continue
-
-                    worker_rank = firm_pref_list.index(worker_id)
-                    worst_current_rank = max(
-                        firm_pref_list.index(w) for w in current_workers if w in firm_pref_list
-                    )
-                    firm_prefers = worker_rank < worst_current_rank
-
-                if not firm_prefers:
-                    continue
-
-                # Check if worker prefers this firm to current employer
-                current_firm = worker_to_firm.get(worker_id, None)
-                new_wage = wage_offers.get((company_id, worker_id), 0.0)
-
-                if current_firm is None:
-                    worker_prefers = new_wage > 0  # Unemployed worker
-                else:
-                    current_wage = wage_offers.get((current_firm, worker_id), 0.0)
-                    worker_prefers = new_wage > current_wage
-
-                if worker_prefers:
-                    # Found blocking pair!
-                    return False
-
-        return True  # No blocking pairs found
-
-    def compute_competitive_equilibrium_wages(
-        self,
-        firm_to_workers: Dict[int, Set[int]],
-        firm_preferences: Dict[int, List[int]],
-        worker_abilities: np.ndarray,  # For computing match values
-        worker_experience: np.ndarray
-    ) -> Dict[int, float]:
-        """
-        Compute competitive equilibrium wages given a matching.
-
-        In equilibrium, wages are set such that:
-        1. Firms are willing to pay (profit ≥ wage)
-        2. Workers are willing to accept (wage ≥ reservation wage)
-        3. No blocking pairs (stability)
-
-        Simplified approach: wage = α * expected_profit
-        where α ∈ [0, 1] is worker's bargaining power
-
-        Args:
-            firm_to_workers: Current matching
-            firm_preferences: Firm preferences (to determine outside options)
-            worker_abilities: Belief about abilities
-            worker_experience: Experience levels
-
-        Returns:
-            Dictionary of worker_id -> equilibrium wage
-        """
-        beta = 0.5
-        alpha = 0.6  # Workers capture 60% of surplus (Nash bargaining default)
-
-        wages = {}
-
-        for company_id, workers in firm_to_workers.items():
-            for worker_id in workers:
-                # Compute match value
-                expected_profit = (
-                    worker_abilities[worker_id] +
-                    beta * np.log1p(worker_experience[worker_id])
-                )
-
-                # Worker captures fraction α of the surplus
-                # (Remaining goes to firm)
-                wage = alpha * expected_profit
-                wages[worker_id] = max(0.0, wage)
-
-        return wages
-
-
-def compare_matching_mechanisms(
-    greedy_outcome: MatchingOutcome,
-    stable_outcome: MatchingOutcome
-) -> Dict[str, float]:
-    """
-    Compare greedy vs stable matching outcomes.
-
-    Metrics:
-    - Time to match
-    - Number of matches
-    - Average wage
-    - Stability
-
-    Args:
-        greedy_outcome: Result from greedy mechanism
-        stable_outcome: Result from stable matching
-
-    Returns:
-        Dictionary of comparison metrics
-    """
-    greedy_matches = sum(len(workers) for workers in greedy_outcome.matches.values())
-    stable_matches = sum(len(workers) for workers in stable_outcome.matches.values())
-
-    greedy_avg_wage = np.mean(list(greedy_outcome.wages.values())) if greedy_outcome.wages else 0.0
-    stable_avg_wage = np.mean(list(stable_outcome.wages.values())) if stable_outcome.wages else 0.0
-
-    return {
-        'greedy_time_to_match': greedy_outcome.time_to_match,
-        'stable_time_to_match': stable_outcome.time_to_match,
-        'greedy_num_matches': greedy_matches,
-        'stable_num_matches': stable_matches,
-        'greedy_avg_wage': greedy_avg_wage,
-        'stable_avg_wage': stable_avg_wage,
-        'greedy_is_stable': greedy_outcome.is_stable,
-        'stable_is_stable': stable_outcome.is_stable,
-        'time_difference': stable_outcome.time_to_match - greedy_outcome.time_to_match,
-        'match_efficiency_ratio': stable_matches / max(greedy_matches, 1),
-    }
+    return WageMatchingResult(
+        firm_to_worker=firm_to_worker,
+        worker_to_firm=worker_to_firm,
+        worker_wage=worker_wage,
+    )

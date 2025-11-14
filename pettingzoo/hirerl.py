@@ -20,7 +20,7 @@ Observation Space (Partial Observability):
 - Firm's current workforce and profits
 
 Reward:
-r_i,t = Σ_{j ∈ E_i,t} (p_ij,t - w_ij,t) - c_fire - c_hire
+r_i,t = Σ_{j ∈ E_i,t} (p_ij,t - w_ij,t) - c_fire - c_interview
 
 where p_ij,t = σ_j + β*log(1 + exp_j,t) depends on TRUE ability (private info)
 """
@@ -33,7 +33,7 @@ from typing import Dict, List, Any, Tuple, Optional, Set
 from enum import IntEnum
 
 from workers import WorkerPool, WorkerState
-from screening import ScreeningMechanism, FirmBeliefs, ScreeningTechnology
+from after_hiring_update import ScreeningMechanism, FirmBeliefs, ScreeningTechnology
 
 
 class ActionType(IntEnum):
