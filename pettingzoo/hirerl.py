@@ -43,10 +43,10 @@ class JobMarketEnv(ParallelEnv):
 
     def __init__(
         self,
-        num_companies: int = 3,
+        num_companies: int = 1,
         num_workers: int = 10,
         ability_dim: int = 1,
-        max_workers_per_company: int = 2,
+        max_workers_per_company: int = 5,
         gamma: float = 0.1,
         g0: float = 0.1,
         g1: float = 0.05,
