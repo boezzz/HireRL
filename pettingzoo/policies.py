@@ -47,13 +47,9 @@ class GreedyPolicy:
     def __init__(
         self,
         num_workers: int,
-        num_companies: int,
-        max_workers_per_company: int,
-        ability_dim: int = 1
+        ability_dim: int = 1,
     ):
         self.num_workers = num_workers
-        self.num_companies = num_companies
-        self.max_workers_per_company = max_workers_per_company
         self.ability_dim = ability_dim
 
     def _parse_observation(
@@ -115,69 +111,79 @@ class GreedyPolicy:
             'own_profit': own_profit
         }
 
-    def _compute_expected_profit(
-        self, worker_id: int, parsed_obs: Dict[str, np.ndarray]
-    ) -> float:
-        """Compute expected profit based on beliefs."""
-        beta = 0.5
-        belief_mean = parsed_obs['belief_mean'][worker_id, 0]  # Assuming d=1
-        experience = parsed_obs['experience'][worker_id]
-
-        return belief_mean + beta * np.log1p(experience)
 
     def get_action(self, observation, agent: str) -> int:
         """
-        Select greedy action.
+        Select a greedy interview-cost action.
+
+        In the current environment, firms do not directly choose which worker
+        to hire or fire. Instead, each firm's discrete action controls how much
+        to invest in interviewing (screening) the worker assigned to it by the
+        deterministic interview mechanism in the environment.
 
         Logic:
-        1. Compute expected profit for all workers
-        2. If have capacity and unemployed workers available: hire best
-        3. If at capacity: check if can upgrade (fire worst, hire better)
-        4. Otherwise: no-op
+        1. Parse observation and compute expected profit proxies for workers.
+        2. Look at unemployed workers: if there is high expected surplus, invest
+           more in screening; otherwise, invest little or nothing.
+        3. Map this intensity choice into a discrete action using the action_mask:
+           - smallest valid index   -> interpreted as "no-op" / lowest cost
+           - largest valid index    -> interpreted as "highest cost"
+           - a middle valid index   -> medium cost (if available)
         """
-        # Handle dict observation format
+        # Handle dict observation format and extract action_mask
         if isinstance(observation, dict):
             obs_array = observation['observation']
+            action_mask = observation.get('action_mask', None)
         else:
             obs_array = observation
+            action_mask = None
 
         parsed = self._parse_observation(obs_array)
 
-        # Get current workforce
-        own_workforce = parsed['own_workforce']
-        workforce_ids = [i for i in range(self.num_workers) if own_workforce[i] > 0.5]
-        workforce_size = len(workforce_ids)
-
-        # Get unemployed workers
+        # Identify unemployed workers (employed_by < 0)
         unemployed_ids = [
             i for i in range(self.num_workers)
-            if parsed['employed_by'][i] < 0  # -1 means unemployed
+            if parsed['employed_by'][i] < 0
         ]
 
-        # Compute expected profits
-        expected_profits = {
-            i: self._compute_expected_profit(i, parsed)
-            for i in range(self.num_workers)
-        }
+        if unemployed_ids:
+            expected_profits = {
+                i: self._compute_expected_profit(i, parsed)
+                for i in unemployed_ids
+            }
+            max_exp_profit = max(expected_profits.values())
+        else:
+            max_exp_profit = 0.0
 
-        # Case 1: Have capacity, hire best unemployed
-        if workforce_size < self.max_workers_per_company and unemployed_ids:
-            best_unemployed = max(unemployed_ids, key=lambda i: expected_profits[i])
-            # Offer action: N+1 to 2N
-            return self.num_workers + 1 + best_unemployed
+        # Determine valid discrete actions
+        if action_mask is not None:
+            valid_actions = [i for i, v in enumerate(action_mask) if v == 1]
+        else:
+            # Fallback: assume a small fixed action space: {0,1,2,3}
+            valid_actions = list(range(4))
 
-        # Case 2: At capacity, try to upgrade
-        if workforce_size >= self.max_workers_per_company and unemployed_ids:
-            worst_employee = min(workforce_ids, key=lambda i: expected_profits[i])
-            best_unemployed = max(unemployed_ids, key=lambda i: expected_profits[i])
+        if not valid_actions:
+            return 0
 
-            # Fire if upgrade is beneficial
-            if expected_profits[best_unemployed] > expected_profits[worst_employee] + 0.5:  # Margin for costs
-                # Fire action: 1 to N
-                return 1 + worst_employee
+        valid_actions_sorted = sorted(valid_actions)
+        no_op_action = valid_actions_sorted[0]
+        highest_cost_action = valid_actions_sorted[-1]
+        if len(valid_actions_sorted) >= 3:
+            mid_idx = len(valid_actions_sorted) // 2
+            mid_cost_action = valid_actions_sorted[mid_idx]
+        else:
+            mid_cost_action = highest_cost_action
 
-        # Default: no-op
-        return 0
+        # Heuristic mapping from expected profit to interview intensity
+        if max_exp_profit <= 0.0:
+            # No promising unemployed workers: do nothing / lowest cost
+            return no_op_action
+        elif max_exp_profit < 1.0:
+            # Moderate opportunity: invest medium screening cost
+            return mid_cost_action
+        else:
+            # High expected surplus: invest highest available screening cost
+            return highest_cost_action
 
 
 class NoScreeningPolicy:
@@ -190,24 +196,27 @@ class NoScreeningPolicy:
     def __init__(
         self,
         num_workers: int,
-        num_companies: int,
-        max_workers_per_company: int,
         ability_dim: int = 1
     ):
         self.greedy_policy = GreedyPolicy(
-            num_workers, num_companies, max_workers_per_company, ability_dim
+            num_workers, ability_dim
         )
         self.num_workers = num_workers
 
     def get_action(self, observation, agent: str) -> int:
-        """Get greedy action, but never interview."""
-        action = self.greedy_policy.get_action(observation, agent)
+        """Never invest in screening: always choose the lowest-cost/no-op action."""
+        if isinstance(observation, dict):
+            action_mask = observation.get('action_mask', None)
+        else:
+            action_mask = None
 
-        # If action is interview (2N+1 to 3N), convert to no-op
-        if action > 2 * self.num_workers:
-            return 0  # No-op
-
-        return action
+        if action_mask is not None:
+            valid_actions = [i for i, v in enumerate(action_mask) if v == 1]
+            if valid_actions:
+                return min(valid_actions)
+            return 0
+        # Fallback: assume action 0 is no-op
+        return 0
 
 
 class HighScreeningPolicy:
@@ -222,50 +231,43 @@ class HighScreeningPolicy:
     def __init__(
         self,
         num_workers: int,
-        num_companies: int,
-        max_workers_per_company: int,
         ability_dim: int = 1,
         seed: Optional[int] = None
     ):
         self.greedy_policy = GreedyPolicy(
-            num_workers, num_companies, max_workers_per_company, ability_dim
+            num_workers, ability_dim
         )
         self.num_workers = num_workers
         self.rng = np.random.RandomState(seed)
 
-        # Track which workers have been screened (per agent)
-        self.screened_workers: Dict[str, set] = {}
-
     def get_action(self, observation, agent: str) -> int:
         """
-        With some probability, interview an unscreened worker.
-        Otherwise, use greedy policy.
+        With some probability, choose a high screening cost.
+        Otherwise, use the greedy cost-based policy.
         """
-        if agent not in self.screened_workers:
-            self.screened_workers[agent] = set()
-
         # Handle dict observation format
         if isinstance(observation, dict):
-            obs_array = observation['observation']
+            action_mask = observation.get('action_mask', None)
         else:
-            obs_array = observation
+            action_mask = None
 
-        parsed = self.greedy_policy._parse_observation(obs_array)
+        if action_mask is not None:
+            valid_actions = [i for i, v in enumerate(action_mask) if v == 1]
+        else:
+            valid_actions = list(range(4))
 
-        # Find unemployed workers who haven't been screened
-        unemployed_unscreened = [
-            i for i in range(self.num_workers)
-            if parsed['employed_by'][i] < 0 and i not in self.screened_workers[agent]
-        ]
+        if not valid_actions:
+            return 0
 
-        # 30% chance to screen an unscreened worker
-        if unemployed_unscreened and self.rng.rand() < 0.3:
-            worker_to_screen = self.rng.choice(unemployed_unscreened)
-            self.screened_workers[agent].add(worker_to_screen)
-            # Interview action: 2N+1 to 3N
-            return 2 * self.num_workers + 1 + worker_to_screen
+        valid_actions_sorted = sorted(valid_actions)
+        no_op_action = valid_actions_sorted[0]
+        highest_cost_action = valid_actions_sorted[-1]
 
-        # Otherwise use greedy policy
+        # 30% chance to choose the highest screening cost
+        if self.rng.rand() < 0.3:
+            return highest_cost_action
+
+        # Otherwise, fall back to greedy cost choice
         return self.greedy_policy.get_action(observation, agent)
 
 
@@ -279,24 +281,16 @@ class NeverFirePolicy:
     def __init__(
         self,
         num_workers: int,
-        num_companies: int,
-        max_workers_per_company: int,
         ability_dim: int = 1
     ):
         self.greedy_policy = GreedyPolicy(
-            num_workers, num_companies, max_workers_per_company, ability_dim
+            num_workers, ability_dim
         )
         self.num_workers = num_workers
 
     def get_action(self, observation, agent: str) -> int:
-        """Get action, but never fire."""
-        action = self.greedy_policy.get_action(observation, agent)
-
-        # If action is fire (1 to N), convert to no-op
-        if 1 <= action <= self.num_workers:
-            return 0  # No-op
-
-        return action
+        """Get action; firing is now handled by the environment's rule."""
+        return self.greedy_policy.get_action(observation, agent)
 
 
 class HeuristicPolicy:
@@ -313,85 +307,72 @@ class HeuristicPolicy:
     def __init__(
         self,
         num_workers: int,
-        num_companies: int,
-        max_workers_per_company: int,
         ability_dim: int = 1,
         target_workforce_ratio: float = 0.8,
         screening_threshold: float = 0.5
     ):
         self.num_workers = num_workers
-        self.num_companies = num_companies
-        self.max_workers_per_company = max_workers_per_company
         self.ability_dim = ability_dim
-        self.target_workforce = int(max_workers_per_company * target_workforce_ratio)
+        self.target_workforce = target_workforce_ratio
         self.screening_threshold = screening_threshold
 
         self.greedy_policy = GreedyPolicy(
-            num_workers, num_companies, max_workers_per_company, ability_dim
+            num_workers, ability_dim
         )
 
     def get_action(self, observation, agent: str) -> int:
         """
-        Heuristic decision making.
+        Heuristic decision making over interview cost levels.
 
         Priority:
-        1. Fire if workforce too large or low-performing workers
-        2. Screen high-uncertainty workers
-        3. Hire if below target
-        4. No-op
+        1. If there exist unemployed workers with high public signal and high
+           uncertainty, invest in higher-cost screening.
+        2. Otherwise, use the greedy cost-based policy.
         """
         # Handle dict observation format
         if isinstance(observation, dict):
             obs_array = observation['observation']
+            action_mask = observation.get('action_mask', None)
         else:
             obs_array = observation
+            action_mask = None
 
         parsed = self.greedy_policy._parse_observation(obs_array)
 
-        workforce_ids = [i for i in range(self.num_workers) if parsed['own_workforce'][i] > 0.5]
-        workforce_size = len(workforce_ids)
-
         unemployed_ids = [i for i in range(self.num_workers) if parsed['employed_by'][i] < 0]
 
-        # Priority 1: Fire if overcapacity
-        if workforce_size > self.max_workers_per_company:
-            # Fire random worker (overcapacity shouldn't happen, but handle it)
-            return 1 + workforce_ids[0]
-
-        # Priority 2: Screen high-uncertainty unemployed workers
+        # Determine candidate workers for extra screening
+        high_uncertainty_candidates = []
         for i in unemployed_ids:
             variance = parsed['belief_var'][i, 0]  # Assuming d=1
             sigma_hat = parsed['sigma_hat'][i, 0]
-
-            # Screen if: high public signal AND high uncertainty
             if sigma_hat > 0.5 and variance > self.screening_threshold:
-                return 2 * self.num_workers + 1 + i
+                high_uncertainty_candidates.append(i)
 
-        # Priority 3: Hire if below target
-        if workforce_size < self.target_workforce and unemployed_ids:
-            # Hire best available
-            expected_profits = {
-                i: self.greedy_policy._compute_expected_profit(i, parsed)
-                for i in unemployed_ids
-            }
-            best_worker = max(unemployed_ids, key=lambda i: expected_profits[i])
-            return self.num_workers + 1 + best_worker
+        # Determine valid actions
+        if action_mask is not None:
+            valid_actions = [i for i, v in enumerate(action_mask) if v == 1]
+        else:
+            valid_actions = list(range(4))
 
-        # Priority 4: Fire worst performer if can upgrade
-        if workforce_size > 0 and unemployed_ids:
-            expected_profits_all = {
-                i: self.greedy_policy._compute_expected_profit(i, parsed)
-                for i in range(self.num_workers)
-            }
+        if not valid_actions:
+            return 0
 
-            worst_employee = min(workforce_ids, key=lambda i: expected_profits_all[i])
-            best_unemployed = max(unemployed_ids, key=lambda i: expected_profits_all[i])
+        valid_actions_sorted = sorted(valid_actions)
+        no_op_action = valid_actions_sorted[0]
+        highest_cost_action = valid_actions_sorted[-1]
+        if len(valid_actions_sorted) >= 3:
+            mid_idx = len(valid_actions_sorted) // 2
+            mid_cost_action = valid_actions_sorted[mid_idx]
+        else:
+            mid_cost_action = highest_cost_action
 
-            if expected_profits_all[best_unemployed] > expected_profits_all[worst_employee] + 0.5:
-                return 1 + worst_employee
+        if high_uncertainty_candidates:
+            # If there are promising but uncertain workers, use a higher screening cost
+            return mid_cost_action if len(high_uncertainty_candidates) == 1 else highest_cost_action
 
-        # Default: no-op
-        return 0
+        # Otherwise use greedy cost-based policy
+        return self.greedy_policy.get_action(observation, agent)
 
 
 def create_policy(policy_name: str, env_config: Dict) -> object:
@@ -416,19 +397,19 @@ def create_policy(policy_name: str, env_config: Dict) -> object:
         return RandomPolicy(num_workers)
 
     elif policy_name == 'greedy':
-        return GreedyPolicy(num_workers, num_companies, max_workers, ability_dim)
+        return GreedyPolicy(num_workers, ability_dim)
 
     elif policy_name == 'no_screening':
-        return NoScreeningPolicy(num_workers, num_companies, max_workers, ability_dim)
+        return NoScreeningPolicy(num_workers, ability_dim)
 
     elif policy_name == 'high_screening':
-        return HighScreeningPolicy(num_workers, num_companies, max_workers, ability_dim)
+        return HighScreeningPolicy(num_workers, ability_dim)
 
     elif policy_name == 'never_fire':
-        return NeverFirePolicy(num_workers, num_companies, max_workers, ability_dim)
+        return NeverFirePolicy(num_workers, ability_dim)
 
     elif policy_name == 'heuristic':
-        return HeuristicPolicy(num_workers, num_companies, max_workers, ability_dim)
+        return HeuristicPolicy(num_workers, ability_dim)
 
     else:
         raise ValueError(f"Unknown policy: {policy_name}")

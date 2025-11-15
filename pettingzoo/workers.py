@@ -44,10 +44,11 @@ class WorkerPool:
         self,
         num_workers: int,
         ability_dim: int = 1,
-        gamma: float = 0.1,  # Tenure signal growth rate
-        g0: float = 0.1,     # Base experience growth
-        g1: float = 0.05,    # Ability-dependent experience growth
+        gamma: float = 0.1,         # Tenure signal growth rate
+        g0: float = 0.1,            # Base experience growth
+        g1: float = 0.05,           # Ability-dependent experience growth
         signal_noise_std: float = 0.5,  # Noise in initial public signal
+        experience_theta: float = 0.05,  # Decay parameter θ for experience accumulation
         seed: Optional[int] = None
     ):
         """
@@ -68,6 +69,7 @@ class WorkerPool:
         self.g0 = g0
         self.g1 = g1
         self.signal_noise_std = signal_noise_std
+        self.experience_theta = experience_theta
         self.rng = np.random.RandomState(seed)
 
         # Worker states
@@ -117,8 +119,9 @@ class WorkerPool:
         Update worker experience and tenure at end of period.
 
         Experience accumulation (only while employed):
-            exp_{j,t+1} = exp_{j,t} + g(σ_j) * 1{j employed at t}
-            where g(σ_j) = g0 + g1 * σ_j (higher ability → faster learning)
+            exp_{j,t+1} = exp_{j,t}
+                + (g0 + g1 * σ_j) * 1{j employed at t} * exp(-θ * exp_{j,t}),
+            where θ = experience_theta > 0.
 
         Tenure accumulation (only while employed):
             τ_{j,t+1} = τ_{j,t} + 1{j employed at t}
@@ -128,10 +131,12 @@ class WorkerPool:
         """
         for worker in self.workers:
             if worker.employed_by >= 0:  # If employed
-                # Experience grows faster for higher ability workers (learning-by-doing)
-                # This creates heterogeneous returns to experience
+                # Experience grows faster for higher ability workers with diminishing returns:
+                # exp_{j,t+1} = exp_{j,t} + (g0 + g1 * σ_j) * exp(-θ * exp_{j,t})
                 sigma_scalar = worker.sigma_true[0] if self.ability_dim == 1 else np.mean(worker.sigma_true)
-                experience_growth = self.g0 + self.g1 * sigma_scalar
+                experience_growth = (self.g0 + self.g1 * sigma_scalar) * np.exp(
+                    -self.experience_theta * max(0.0, worker.experience)
+                )
                 worker.experience += experience_growth
 
                 # Tenure increments by 1 period
@@ -254,35 +259,6 @@ class WorkerPool:
             'employed_by': np.array([w.employed_by for w in self.workers], dtype=np.int32),
             'wages': np.array([w.wage for w in self.workers], dtype=np.float32),
         }
-
-    def compute_match_profit(self, worker_id: int, company_id: int) -> float:
-        """
-        Compute match-specific profit p(σ, exp) for a worker-company pair.
-
-        Profit function: p_ij = σ_j + β * log(1 + exp_j)
-
-        This captures:
-        - True ability σ_j determines base productivity
-        - Experience has diminishing returns (log function)
-        - Profit depends on TRUE ability (private info), not public signal
-###这里都还是错的。。
-        Args:
-            worker_id: Worker index
-            company_id: Company index (unused for now, could add match-specific effects)
-
-        Returns:
-            Match-specific profit
-        """
-        worker = self.workers[worker_id]
-        beta = 0.5  # Experience return parameter
-
-        # Profit depends on TRUE ability (which firms must infer)
-        sigma_scalar = worker.sigma_true[0] if self.ability_dim == 1 else np.mean(worker.sigma_true)
-        # Clamp experience to non-negative to avoid log1p issues
-        exp_clamped = max(0.0, worker.experience)
-        profit = sigma_scalar + beta * np.log1p(exp_clamped)
-
-        return float(profit)
 
     def get_average_wage(self) -> float:
         """Get average wage of employed workers."""
