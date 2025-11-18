@@ -130,7 +130,7 @@ class JobMarketEnv(ParallelEnv):
             self.max_interview_cost,
             self.num_interview_cost_levels,
             dtype=np.float32,
-        )
+        ) #这还是discrete的。
 
         if self.action_mode == "continuous":
             self.action_low = 0.0
@@ -239,6 +239,7 @@ class JobMarketEnv(ParallelEnv):
             value = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
         else:
             value = float(action)
+        print(float(np.clip(value, self.action_low, self.action_high)))
         return float(np.clip(value, self.action_low, self.action_high))
 
     def _compute_vx(self, exp_t: float, delta_interview_sq: float) -> float:
