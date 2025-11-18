@@ -54,7 +54,8 @@ class PolicyEvaluator:
         checkpoint_paths: Dict[str, str],
         env_config: Dict[str, Any],
         device: str = 'cpu',
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        csv_path: Optional[str] = None,
     ):
         """
         Initialize policy evaluator.
@@ -69,6 +70,7 @@ class PolicyEvaluator:
         self.env_config = env_config
         self.device = device
         self.seed = seed if seed is not None else 42
+        self.csv_path = csv_path
 
         # Create evaluation environment
         self.env = self._create_environment(env_config, self.seed)
@@ -204,7 +206,7 @@ class PolicyEvaluator:
         worker_histories = []  # List of dicts, one per episode
 
         # Logger for detailed tracking
-        logger = EpisodeLogger(self.env.possible_agents)
+        logger = EpisodeLogger(self.env.possible_agents, csv_path=self.csv_path)
         perf_metrics = PerformanceMetrics()
 
         for episode in range(n_episodes):
@@ -311,6 +313,7 @@ class PolicyEvaluator:
             self._print_summary(results)
             self._print_worker_summary(results, n_workers=min(5, num_workers))  # Show top 5 workers
 
+        logger.close()
         return results
 
     def _compute_statistics(
@@ -674,6 +677,8 @@ def main():
                        help='Directory to save evaluation results')
     parser.add_argument('--save_plots', action='store_true',
                        help='Save plots to output directory')
+    parser.add_argument('--step_metrics_csv', type=str, default=None,
+                       help='Optional path to save per-step worker metrics CSV')
 
     args = parser.parse_args()
 
@@ -729,7 +734,8 @@ def main():
         checkpoint_paths=checkpoints,
         env_config=env_config,
         device='cpu',
-        seed=args.seed
+        seed=args.seed,
+        csv_path=args.step_metrics_csv,
     )
 
     # Run evaluation

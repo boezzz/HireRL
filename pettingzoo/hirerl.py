@@ -123,6 +123,7 @@ class JobMarketEnv(ParallelEnv):
         self._interview_signal_at_hire = _init_matrix(0.0)
         self._interview_vars = _init_matrix(base_var)
         self._last_profit = _init_matrix(0.0)
+        self._current_interview_costs = _init_matrix(0.0)
 
         self.cost_levels = np.linspace(
             0.0,
@@ -320,12 +321,30 @@ class JobMarketEnv(ParallelEnv):
     def _get_info(self, agent: str) -> Dict[str, Any]:
         company_idx = self._company_index(agent)
         workforce = self.worker_pool.get_employed_by_company(company_idx)
+        public = self.worker_pool.get_public_state()
+        metrics = []
+        for worker_id in range(self.num_workers):
+            sigma_hat = public["sigma_hat"][worker_id]
+            public_ability = float(sigma_hat[0]) if self.ability_dim == 1 else float(np.mean(sigma_hat))
+            metrics.append(
+                {
+                    "worker_id": worker_id,
+                    "public_tenure": float(public["tenure"][worker_id]),
+                    "public_ability": public_ability,
+                    "experience": float(self.worker_pool.workers[worker_id].experience),
+                    "interview_cost": float(self._current_interview_costs[agent][worker_id]),
+                    "profit": float(self._last_profit[agent][worker_id]),
+                    "private_belief": float(self.firm_beliefs[agent].belief_mean[worker_id, 0]),
+                    "wage": float(self.worker_pool.workers[worker_id].wage),
+                }
+            )
         return {
             "workforce_size": len(workforce),
             "total_profit": float(sum(self.company_profits[agent])),
             "unemployment_rate": self.worker_pool.get_unemployment_rate(),
             "avg_wage": self.worker_pool.get_average_wage(),
             "timestep": self.timestep,
+            "worker_metrics": metrics,
         }
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -351,6 +370,7 @@ class JobMarketEnv(ParallelEnv):
             self._interview_signal_at_hire[agent] = np.zeros(self.num_workers, dtype=np.float32)
             self._interview_vars[agent] = np.full(self.num_workers, base_var, dtype=np.float32)
             self._last_profit[agent] = np.zeros(self.num_workers, dtype=np.float32)
+            self._current_interview_costs[agent] = np.zeros(self.num_workers, dtype=np.float32)
 
         # --- Assign each firm a random initial workforce drawn from the worker pool ---
         all_workers = list(range(self.num_workers))
@@ -392,6 +412,9 @@ class JobMarketEnv(ParallelEnv):
             default = 0 if self.action_mode == "discrete" else 0.0
             decoded_actions[agent] = self._cost_from_action(actions.get(agent, default))
 
+        for agent in self.agents:
+            self._current_interview_costs[agent].fill(0.0)
+
         prev_state = [
             {
                 "experience": worker.experience,
@@ -422,6 +445,7 @@ class JobMarketEnv(ParallelEnv):
             cost = decoded_actions[agent]
 
             screening_costs[agent] += cost
+            self._current_interview_costs[agent][worker_id] = cost
 
             tilde_sigma, _ = self.screening.screen_worker(
                 sigma_true=worker.sigma_true,

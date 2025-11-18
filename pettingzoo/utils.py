@@ -6,9 +6,11 @@ helpers
 - Environment verification
 """
 
-import numpy as np
-from typing import Dict, List, Any, Optional
+import csv
 import json
+from typing import Dict, List, Any, Optional
+
+import numpy as np
 
 
 class EpisodeLogger:
@@ -23,12 +25,30 @@ class EpisodeLogger:
     - Screening decisions
     """
 
-    def __init__(self, agents: List[str]):
+    def __init__(self, agents: List[str], csv_path: Optional[str] = None):
         self.agents = agents
+        self.csv_path = csv_path
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_headers = [
+            'episode',
+            'timestep',
+            'agent',
+            'worker_id',
+            'public_tenure',
+            'public_ability',
+            'experience',
+            'interview_cost',
+            'profit',
+            'private_belief',
+            'wage',
+        ]
+        self.episode_counter = 0
         self.reset()
 
     def reset(self):
         """Reset logger for new episode."""
+        self.episode_counter += 1
         self.timesteps = []
         self.rewards = {agent: [] for agent in self.agents}
         self.workforce_sizes = {agent: [] for agent in self.agents}
@@ -55,6 +75,9 @@ class EpisodeLogger:
         first_agent = self.agents[0]
         self.unemployment_rates.append(infos[first_agent]['unemployment_rate'])
         self.average_wages.append(infos[first_agent]['avg_wage'])
+
+        if self.csv_path:
+            self._log_worker_metrics(timestep, infos)
 
     def get_summary(self) -> Dict[str, Any]:
         """Get summary statistics for episode."""
@@ -93,6 +116,47 @@ class EpisodeLogger:
 
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
+
+    def close(self):
+        if self._csv_file:
+            self._csv_file.close()
+            self._csv_file = None
+            self._csv_writer = None
+
+    def _ensure_csv_writer(self):
+        if self._csv_writer or not self.csv_path:
+            return
+        self._csv_file = open(self.csv_path, 'w', newline='')
+        self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=self._csv_headers)
+        self._csv_writer.writeheader()
+
+    def _log_worker_metrics(self, timestep: int, infos: Dict[str, dict]):
+        if not self.csv_path:
+            return
+        self._ensure_csv_writer()
+        rows = []
+        for agent in self.agents:
+            metrics = infos.get(agent, {}).get('worker_metrics')
+            if not metrics:
+                continue
+            for entry in metrics:
+                rows.append(
+                    {
+                        'episode': self.episode_counter,
+                        'timestep': timestep,
+                        'agent': agent,
+                        'worker_id': entry['worker_id'],
+                        'public_tenure': entry['public_tenure'],
+                        'public_ability': entry['public_ability'],
+                        'experience': entry['experience'],
+                        'interview_cost': entry['interview_cost'],
+                        'profit': entry['profit'],
+                        'private_belief': entry['private_belief'],
+                        'wage': entry['wage'],
+                    }
+                )
+        if rows and self._csv_writer:
+            self._csv_writer.writerows(rows)
 
 
 def compute_market_efficiency(
