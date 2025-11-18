@@ -10,7 +10,7 @@ IPPO Training for Job Market Environment
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'pettingzoo'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'realzoo'))
 
 import csv
 import numpy as np
@@ -24,7 +24,7 @@ import time
 import random
 from collections import defaultdict
 
-from hirerl import JobMarketEnv
+from realzoo.hirerl import JobMarketEnv
 from gymnasium.spaces import Box as GymBox, Discrete as GymDiscrete
 
 
@@ -873,12 +873,12 @@ def main():
 
     # Train
     trainer.train(
-        total_timesteps=1_000_000,
-        n_steps=2048,
+        total_timesteps=1_00,
+        n_steps=20,
         n_epochs=4,
-        batch_size=256,
+        batch_size=20,
         log_interval=5,
-        save_interval=50000
+        save_interval=5
     )
 
     # Evaluate

@@ -228,7 +228,7 @@ def verify_environment(env, num_steps: int = 10, verbose: bool = True):
     """
     Verify environment correctness.
 
-    DEPRECATED: Use pettingzoo.test.parallel_api_test instead for comprehensive testing.
+    DEPRECATED: Use realzoo.test.parallel_api_test instead for comprehensive testing.
 
     This function provides basic checks for:
     - Reset works
@@ -246,7 +246,7 @@ def verify_environment(env, num_steps: int = 10, verbose: bool = True):
         True if all checks pass, False otherwise
     """
     if verbose:
-        print("Verifying environment (use pettingzoo.test.parallel_api_test for full compliance)...")
+        print("Verifying environment (use realzoo.test.parallel_api_test for full compliance)...")
 
     try:
         # Test reset

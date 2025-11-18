@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pettingzoo'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'realzoo'))
 
 import numpy as np
 from pettingzoo.test import parallel_api_test

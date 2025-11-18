@@ -8,7 +8,7 @@ tests different baseline policies in the job market environment:
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pettingzoo'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'realzoo'))
 
 import numpy as np
 from typing import Dict, List
