@@ -89,6 +89,17 @@ The PPO implementation includes CleanRL best practices:
 - **Approx KL**: Should stay <0.1 (policy update stability)
 - **Clip Fraction**: 0.1-0.3 indicates healthy PPO clipping
 
+### Evaluating Trained Policies
+
+Evaluate trained models on new environments:
+
+```bash
+# Evaluate a specific run
+python evaluate_policy.py --run_name hirerl_ippo_20250113_143022 --n_episodes 20 --save_plots
+
+# Checkpoints and configs are stored in runs/{run_name}/
+```
+
 ## Running Tests
 
 ```bash
@@ -248,9 +259,9 @@ MIT License
 If you use this environment in your research, please cite:
 
 ```bibtex
-@article{hirerl2024,
+@article{hirerl2025,
   title={Multi-agent Reinforcement Learning benchmark for job market search and matching},
   author={Zong, Haijing and Zhou, Boyang},
-  year={2024}
+  year={2025}
 }
 ```

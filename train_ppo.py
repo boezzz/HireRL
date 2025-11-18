@@ -305,6 +305,9 @@ class PPOAgent:
 
         Returns dictionary with training metrics including explained variance.
         """
+        # Ensure network is in training mode
+        self.network.train()
+
         # Get rollout data
         data = self.buffer.get()
 
@@ -463,6 +466,7 @@ class IPPOTrainer:
         self.device = device
         self.initial_lr = lr
         self.anneal_lr = anneal_lr
+        self.seed = seed
 
         # Set seeds for reproducibility
         random.seed(seed)
@@ -492,11 +496,48 @@ class IPPOTrainer:
                 device=device
             )
 
-        # TensorBoard writer
+        # Setup run directory
         if run_name is None:
             run_name = f"ippo_{int(time.time())}"
-        self.writer = SummaryWriter(f"runs/{run_name}")
         self.run_name = run_name
+        self.run_dir = f"runs/{run_name}"
+        os.makedirs(self.run_dir, exist_ok=True)
+
+        # TensorBoard writer (logs go directly in run_dir)
+        self.writer = SummaryWriter(self.run_dir)
+
+        # Save training config
+        import json
+        self.config = {
+            'env': {
+                'num_companies': env.num_companies,
+                'num_workers': env.num_workers,
+                'max_workers_per_company': env.max_workers_per_company,
+                'ability_dim': env.ability_dim,
+                'gamma': env.gamma,
+                'g0': env.g0,
+                'g1': env.g1,
+                'base_firing_cost': env.base_firing_cost,
+                'base_hiring_cost': env.base_hiring_cost,
+                'base_screening_cost': env.base_screening_cost,
+                'worker_bargaining_power': env.worker_bargaining_power,
+                'max_timesteps': env.max_timesteps,
+            },
+            'training': {
+                'lr': lr,
+                'gamma': gamma,
+                'gae_lambda': gae_lambda,
+                'clip_epsilon': clip_epsilon,
+                'value_coef': value_coef,
+                'entropy_coef': entropy_coef,
+                'max_grad_norm': max_grad_norm,
+                'device': device,
+                'seed': seed,
+                'anneal_lr': anneal_lr
+            }
+        }
+        with open(f"{self.run_dir}/config.json", 'w') as f:
+            json.dump(self.config, f, indent=2)
 
         # Log hyperparameters
         self.writer.add_text(
@@ -597,8 +638,7 @@ class IPPOTrainer:
         n_epochs: int = 4,
         batch_size: int = 64,
         log_interval: int = 10,
-        save_interval: int = 100,
-        save_path: str = 'checkpoints'
+        save_interval: int = 100
     ):
         """
         Train all agents using Independent PPO.
@@ -609,20 +649,14 @@ class IPPOTrainer:
         - Explained variance tracking
         - Action masking
         """
-        os.makedirs(save_path, exist_ok=True)
+        # Create checkpoint directory
+        checkpoint_dir = f"{self.run_dir}/checkpoints"
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
         n_updates = total_timesteps // n_steps
 
-        print("="*70)
-        print("INDEPENDENT PPO TRAINING")
-        print("="*70)
-        print(f"Total timesteps: {total_timesteps:,}")
-        print(f"Steps per rollout: {n_steps}")
-        print(f"Number of updates: {n_updates}")
-        print(f"Agents: {self.env.possible_agents}")
-        print(f"Run name: {self.run_name}")
-        print(f"TensorBoard: runs/{self.run_name}")
-        print("="*70)
+        print(f"\nTraining IPPO: {self.run_name}")
+        print(f"Timesteps: {total_timesteps:,} | Updates: {n_updates} | Agents: {len(self.env.possible_agents)}")
 
         start_time = time.time()
 
@@ -672,47 +706,39 @@ class IPPOTrainer:
 
             # Console logging
             if update % log_interval == 0:
-                print(f"\n{'='*70}")
-                print(f"Update {update}/{n_updates} | Timesteps: {current_timesteps:,} | SPS: {sps:.0f}")
-                if self.anneal_lr:
-                    print(f"Learning Rate: {lr_now:.6f}")
-                print(f"{'='*70}")
-
-                for agent_name, stats in update_stats.items():
-                    print(f"\n{agent_name}:")
-                    print(f"  Policy Loss: {stats['policy_loss']:.4f}")
-                    print(f"  Value Loss: {stats['value_loss']:.4f}")
-                    print(f"  Entropy: {stats['entropy']:.4f}")
-                    print(f"  Clip Fraction: {stats['clip_fraction']:.4f}")
-                    print(f"  Approx KL: {stats['approx_kl']:.4f}")
-                    print(f"  Explained Var: {stats['explained_variance']:.4f}")
+                avg_policy_loss = np.mean([s['policy_loss'] for s in update_stats.values()])
+                avg_value_loss = np.mean([s['value_loss'] for s in update_stats.values()])
+                avg_entropy = np.mean([s['entropy'] for s in update_stats.values()])
+                lr_str = f" | LR: {lr_now:.6f}" if self.anneal_lr else ""
+                print(f"[{update}/{n_updates}] Step {current_timesteps:,} | SPS: {sps:.0f}{lr_str} | "
+                      f"PL: {avg_policy_loss:.3f} VL: {avg_value_loss:.3f} Ent: {avg_entropy:.3f}")
 
             # Save checkpoints
             if update % save_interval == 0:
                 for agent_name in self.env.possible_agents:
-                    model_path = os.path.join(save_path, f"{agent_name}_update_{update}.pt")
+                    model_path = os.path.join(checkpoint_dir, f"{agent_name}_update_{update}.pt")
                     torch.save(self.agents[agent_name].network.state_dict(), model_path)
-                print(f"\n✓ Saved checkpoints at update {update}")
+                print(f"  ✓ Checkpoint saved at update {update}")
 
         # Save final models
         for agent_name in self.env.possible_agents:
-            model_path = os.path.join(save_path, f"{agent_name}_final.pt")
+            model_path = os.path.join(checkpoint_dir, f"{agent_name}_final.pt")
             torch.save(self.agents[agent_name].network.state_dict(), model_path)
 
-        print(f"\n{'='*70}")
-        print("TRAINING COMPLETE!")
-        print(f"Total time: {time.time() - start_time:.2f}s")
-        print(f"Final models saved to: {save_path}")
-        print(f"TensorBoard logs: runs/{self.run_name}")
-        print(f"{'='*70}\n")
+        elapsed_time = time.time() - start_time
+        print(f"\n✓ Training complete! Time: {elapsed_time:.1f}s")
+        print(f"  Models: {self.run_dir}/checkpoints/")
+        print(f"  Logs: {self.run_dir}/")
 
         self.writer.close()
 
     def evaluate(self, n_episodes: int = 10, deterministic: bool = True):
         """Evaluate learned policies with action masking."""
-        print(f"\n{'='*70}")
-        print(f"EVALUATION ({n_episodes} episodes)")
-        print(f"{'='*70}\n")
+        # Set all networks to eval mode
+        for agent in self.agents.values():
+            agent.network.eval()
+
+        print(f"\nEvaluating {n_episodes} episodes...")
 
         episode_rewards = {agent: [] for agent in self.env.possible_agents}
         episode_lengths = []
@@ -748,18 +774,17 @@ class IPPOTrainer:
                 episode_rewards[agent_name].append(ep_rewards.get(agent_name, 0.0))
             episode_lengths.append(ep_length)
 
-            print(f"Episode {episode + 1}: Length={ep_length}, Rewards={ep_rewards}")
-
         # Print summary
-        print(f"\n{'='*70}")
-        print("EVALUATION SUMMARY")
-        print(f"{'='*70}")
+        print(f"\nEvaluation Results:")
         for agent_name in self.env.possible_agents:
             mean_reward = np.mean(episode_rewards[agent_name])
             std_reward = np.std(episode_rewards[agent_name])
-            print(f"{agent_name}: {mean_reward:.2f} ± {std_reward:.2f}")
-        print(f"Mean Episode Length: {np.mean(episode_lengths):.1f}")
-        print(f"{'='*70}\n")
+            print(f"  {agent_name}: {mean_reward:.2f} ± {std_reward:.2f}")
+        print(f"  Episode Length: {np.mean(episode_lengths):.1f}")
+
+        # Restore networks to train mode
+        for agent in self.agents.values():
+            agent.network.train()
 
 
 def main():
@@ -794,13 +819,12 @@ def main():
 
     # Train
     trainer.train(
-        total_timesteps=1_000_000,  # 1M steps
-        n_steps=2048,             # Collect 2048 steps before update
-        n_epochs=4,               # 4 epochs per update
-        batch_size=256,            # Batch size 64
-        log_interval=5,           # Log every 5 updates
-        save_interval=50000,         # Save every 50000 updates
-        save_path='checkpoints'
+        total_timesteps=1_000_000,
+        n_steps=2048,
+        n_epochs=4,
+        batch_size=256,
+        log_interval=5,
+        save_interval=50000
     )
 
     # Evaluate
