@@ -12,6 +12,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'pettingzoo'))
 
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,7 +25,20 @@ import random
 from collections import defaultdict
 
 from hirerl import JobMarketEnv
-from utils import EpisodeLogger, PerformanceMetrics
+
+
+def set_global_seed(seed: int) -> None:
+    """
+    Seed all major RNG sources to keep experiments reproducible.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -459,8 +473,10 @@ class IPPOTrainer:
         max_grad_norm: float = 0.5,
         device: str = 'cpu',
         seed: int = 42,
-        anneal_lr: bool = True,
-        run_name: Optional[str] = None
+        anneal_lr: bool = False,
+        run_name: Optional[str] = None,
+        log_step_data: bool = True,
+        step_log_path: Optional[str] = None
     ):
         self.env = env
         self.device = device
@@ -469,10 +485,7 @@ class IPPOTrainer:
         self.seed = seed
 
         # Set seeds for reproducibility
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
+        set_global_seed(seed)
 
         # Create PPO agent for each company
         self.agents: Dict[str, PPOAgent] = {}
@@ -539,6 +552,16 @@ class IPPOTrainer:
         with open(f"{self.run_dir}/config.json", 'w') as f:
             json.dump(self.config, f, indent=2)
 
+        # Per-step logging
+        self.log_step_data = log_step_data
+        self.step_log_path = step_log_path or os.path.join("runs", run_name, "step_log.csv")
+        self._step_log_buffer: List[Dict[str, float]] = []
+        self._step_log_fieldnames = ['global_step', 'agent', 'action', 'reward']
+        self._step_log_initialized = False
+        if self.log_step_data:
+            os.makedirs(os.path.dirname(self.step_log_path), exist_ok=True)
+            self._init_step_log_file()
+
         # Log hyperparameters
         self.writer.add_text(
             "hyperparameters",
@@ -560,6 +583,24 @@ class IPPOTrainer:
         self.episode_rewards = {agent: [] for agent in env.possible_agents}
         self.episode_lengths = []
         self.global_step = 0
+
+    def _init_step_log_file(self):
+        if not self.log_step_data or self._step_log_initialized:
+            return
+        file_exists = os.path.exists(self.step_log_path)
+        with open(self.step_log_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self._step_log_fieldnames)
+            if not file_exists:
+                writer.writeheader()
+        self._step_log_initialized = True
+
+    def _flush_step_log_buffer(self):
+        if not self.log_step_data or not self._step_log_buffer:
+            return
+        with open(self.step_log_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self._step_log_fieldnames)
+            writer.writerows(self._step_log_buffer)
+        self._step_log_buffer.clear()
 
     def collect_rollout(self, n_steps: int):
         """Collect n_steps of experience for each agent with action masking."""
@@ -610,6 +651,16 @@ class IPPOTrainer:
                     done=done
                 )
 
+            if self.log_step_data:
+                for agent_name in self.env.agents:
+                    reward = rewards.get(agent_name, 0.0)
+                    self._step_log_buffer.append({
+                        'global_step': self.global_step,
+                        'agent': agent_name,
+                        'action': actions[agent_name],
+                        'reward': reward
+                    })
+
             observations = next_observations
             self.global_step += 1
 
@@ -629,6 +680,7 @@ class IPPOTrainer:
                 current_episode_rewards = {agent: 0.0 for agent in self.env.possible_agents}
                 episode_length = 0
 
+        self._flush_step_log_buffer()
         return observations
 
     def train(
@@ -789,13 +841,18 @@ class IPPOTrainer:
 
 def main():
     """Main training script."""
+    seed = 42
+
+    # Ensure deterministic behavior before anything else
+    set_global_seed(seed)
+
     # Create environment
     env = JobMarketEnv(
-        num_companies=3,
+        num_companies=1,
         num_workers=10,
         max_workers_per_company=5,
         max_timesteps=100,
-        seed=42
+        seed=seed
     )
 
     # Create trainer with unique run name
@@ -812,8 +869,8 @@ def main():
         value_coef=0.5,
         entropy_coef=0.01,
         device='cpu',
-        seed=42,
-        anneal_lr=True,
+        seed=seed,
+        anneal_lr=False,
         run_name=run_name
     )
 
