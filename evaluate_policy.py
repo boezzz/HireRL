@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from hirerl import JobMarketEnv
+from gymnasium.spaces import Box as GymBox, Discrete as GymDiscrete
 from utils import EpisodeLogger, PerformanceMetrics, compute_gini_coefficient
 from train_ppo import ActorCritic
 
@@ -86,9 +87,10 @@ class PolicyEvaluator:
             g0=config.get('g0', 0.1),
             g1=config.get('g1', 0.05),
             base_firing_cost=config.get('base_firing_cost', 0.1),
-            base_hiring_cost=config.get('base_hiring_cost', 0.2),
             base_screening_cost=config.get('base_screening_cost', 0.5),
-            worker_bargaining_power=config.get('worker_bargaining_power', 0.6),
+            max_interview_cost=config.get('max_interview_cost', 2.0),
+            num_interview_cost_levels=config.get('num_interview_cost_levels', 5),
+            action_mode=config.get('action_mode', 'continuous'),
             max_timesteps=config.get('max_timesteps', 100),
             seed=seed
         )
@@ -114,10 +116,27 @@ class PolicyEvaluator:
             # Get observation and action dimensions from environment
             obs_space = self.env.observation_space(agent_name)
             obs_dim = obs_space.spaces['observation'].shape[0]
-            action_dim = self.env.action_space(agent_name).n
+            action_space = self.env.action_space(agent_name)
+            if isinstance(action_space, GymBox):
+                action_type = "continuous"
+                action_dim = int(np.prod(action_space.shape))
+                action_low = action_space.low
+                action_high = action_space.high
+            elif isinstance(action_space, GymDiscrete):
+                action_type = "discrete"
+                action_dim = action_space.n
+                action_low = None
+                action_high = None
+            else:
+                raise NotImplementedError("Unsupported action space type")
 
-            # Create network
-            network = ActorCritic(obs_dim, action_dim).to(self.device)
+            network = ActorCritic(
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                action_type=action_type,
+                action_low=action_low,
+                action_high=action_high,
+            ).to(self.device)
 
             # Load checkpoint
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -142,7 +161,6 @@ class PolicyEvaluator:
                     f"  You CAN change other parameters like:\n"
                     f"  - Costs (firing, hiring, screening)\n"
                     f"  - Dynamics (gamma, g0, g1)\n"
-                    f"  - Worker bargaining power\n"
                     f"  - Max timesteps\n\n"
                     f"Original error: {str(e)}\n"
                     f"{'='*70}\n"
@@ -237,18 +255,22 @@ class PolicyEvaluator:
                         # Random action for agents without loaded policy
                         actions[agent_name] = self.env.action_space(agent_name).sample()
 
-                # Decode and track actions
-                for agent_name, action_id in actions.items():
+                assignments = self.env._deterministic_interview_assignments()
+                for agent_name, action_val in actions.items():
                     company_idx = int(agent_name.split("_")[1])
-                    action_type, worker_id, value = self.env._decode_action(agent_name, action_id)
-
-                    if worker_id is not None:
-                        worker_trajectories[worker_id]['actions_received'].append({
-                            'timestep': ep_length,
-                            'company_id': company_idx,
-                            'action_type': action_type,
-                            'value': value
-                        })
+                    worker_id = assignments.get(company_idx)
+                    if worker_id is None:
+                        continue
+                    if getattr(self.env, "action_mode", "continuous") == "discrete":
+                        action_cost = float(self.env.cost_levels[int(action_val)])
+                    else:
+                        action_cost = float(np.asarray(action_val).reshape(-1)[0])
+                    worker_trajectories[worker_id]['actions_received'].append({
+                        'timestep': ep_length,
+                        'company_id': company_idx,
+                        'action_type': 'interview_cost',
+                        'value': action_cost
+                    })
 
                 # Step environment
                 next_observations, rewards, terminations, truncations, infos = self.env.step(actions)
@@ -607,9 +629,10 @@ def create_env_config_from_training(
         'g0': kwargs.get('g0', 0.1),
         'g1': kwargs.get('g1', 0.05),
         'base_firing_cost': kwargs.get('base_firing_cost', 0.1),
-        'base_hiring_cost': kwargs.get('base_hiring_cost', 0.2),
         'base_screening_cost': kwargs.get('base_screening_cost', 0.5),
-        'worker_bargaining_power': kwargs.get('worker_bargaining_power', 0.6),
+        'max_interview_cost': kwargs.get('max_interview_cost', 2.0),
+        'num_interview_cost_levels': kwargs.get('num_interview_cost_levels', 5),
+        'action_mode': kwargs.get('action_mode', 'continuous'),
         'max_timesteps': kwargs.get('max_timesteps', 100)
     }
 

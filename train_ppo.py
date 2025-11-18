@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal
 from torch.utils.tensorboard import SummaryWriter
 from typing import Dict, List, Tuple, Optional
 import time
@@ -25,6 +25,7 @@ import random
 from collections import defaultdict
 
 from hirerl import JobMarketEnv
+from gymnasium.spaces import Box as GymBox, Discrete as GymDiscrete
 
 
 def set_global_seed(seed: int) -> None:
@@ -54,145 +55,137 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class ActorCritic(nn.Module):
     """
-    Actor-Critic network for PPO with action masking support.
-
-    Architecture:
-    - Shared feature extractor
-    - Actor head (policy): outputs action logits
-    - Critic head (value): outputs state value estimate
-
-    Features:
-    - Orthogonal initialization
-    - Action masking in forward pass
+    Actor-Critic network supporting both continuous and discrete actions.
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 128):
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        action_type: str,
+        action_low: Optional[np.ndarray] = None,
+        action_high: Optional[np.ndarray] = None,
+        hidden_dim: int = 128,
+    ):
         super().__init__()
+        self.action_type = action_type
 
-        # Shared feature extractor with orthogonal init
+        if self.action_type == "continuous":
+            if action_low is None or action_high is None:
+                raise ValueError("Continuous actions require action bounds.")
+            self.register_buffer("_action_low", torch.tensor(action_low, dtype=torch.float32))
+            self.register_buffer("_action_high", torch.tensor(action_high, dtype=torch.float32))
+
         self.shared = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden_dim)),
             nn.ReLU(),
             layer_init(nn.Linear(hidden_dim, hidden_dim)),
-            nn.ReLU()
+            nn.ReLU(),
         )
 
-        # Actor head (policy) - small std for better initial exploration
-        self.actor = layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
+        if self.action_type == "continuous":
+            self.actor_mean = layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
+            self.log_std = nn.Parameter(torch.zeros(action_dim))
+        else:
+            self.actor_logits = layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
 
-        # Critic head (value function) - std=1 as per CleanRL
         self.critic = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
 
-    def forward(self, x, action_mask=None):
-        """
-        Forward pass with optional action masking.
+    def _squash(self, raw_action: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(raw_action)
 
-        Args:
-            x: Observation tensor
-            action_mask: Optional binary mask (1=valid, 0=invalid)
+    def _scale(self, squashed_action: torch.Tensor) -> torch.Tensor:
+        action_range = self._action_high - self._action_low
+        return self._action_low + 0.5 * (squashed_action + 1.0) * action_range
 
-        Returns:
-            action_logits: Logits for action distribution (masked if mask provided)
-            value: State value estimate
-        """
-        features = self.shared(x)
-        action_logits = self.actor(features)
+    def act(
+        self,
+        obs_tensor: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        features = self.shared(obs_tensor)
+        value = self.critic(features).squeeze(-1)
 
-        # Apply action masking if provided
-        if action_mask is not None:
-            # Set logits of invalid actions to -inf
-            action_logits = torch.where(
-                action_mask.bool(),
-                action_logits,
-                torch.tensor(-1e8, dtype=action_logits.dtype, device=action_logits.device)
-            )
+        if self.action_type == "continuous":
+            mean = self.actor_mean(features)
+            log_std = self.log_std.expand_as(mean)
+            std = torch.exp(log_std)
+            dist = Normal(mean, std)
+            raw_action = mean if deterministic else dist.rsample()
+            squashed = self._squash(raw_action)
+            action = self._scale(squashed)
+            log_prob = dist.log_prob(raw_action).sum(dim=-1)
+            correction = torch.log(1 - squashed.pow(2) + 1e-6).sum(dim=-1)
+            log_prob = log_prob - correction
+            entropy = dist.entropy().sum(dim=-1)
+            return action, raw_action, log_prob, entropy, value
 
-        value = self.critic(features)
-        return action_logits, value
-
-    def get_action(self, obs_dict, deterministic=False):
-        """
-        Sample action from policy with action masking.
-
-        Args:
-            obs_dict: Dictionary with 'observation' and 'action_mask' keys
-            deterministic: If True, select argmax instead of sampling
-
-        Returns:
-            action: Selected action
-        """
-        with torch.no_grad():
-            # Extract observation and mask
-            if isinstance(obs_dict, dict):
-                obs = obs_dict['observation']
-                action_mask = obs_dict['action_mask']
-            else:
-                # Fallback for non-dict observations (backwards compatibility)
-                obs = obs_dict
-                action_mask = None
-
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
-
-            if action_mask is not None:
-                mask_tensor = torch.FloatTensor(action_mask).unsqueeze(0)
-            else:
-                mask_tensor = None
-
-            action_logits, value = self.forward(obs_tensor, mask_tensor)
-
-            if deterministic:
-                action = action_logits.argmax(dim=-1)
-            else:
-                probs = torch.softmax(action_logits, dim=-1)
-                dist = Categorical(probs)
-                action = dist.sample()
-
-            return action.item()
-
-    def evaluate_actions(self, obs, actions, action_masks=None):
-        """
-        Evaluate log probabilities and values for given observations and actions.
-
-        Args:
-            obs: Observation tensor
-            actions: Action tensor
-            action_masks: Optional action mask tensor
-
-        Returns:
-            log_probs: Log probabilities of actions
-            values: Value estimates
-            entropy: Policy entropy
-        """
-        action_logits, values = self.forward(obs, action_masks)
-        probs = torch.softmax(action_logits, dim=-1)
-        dist = Categorical(probs)
-
-        log_probs = dist.log_prob(actions)
+        logits = self.actor_logits(features)
+        dist = Categorical(logits=logits)
+        if deterministic:
+            action = torch.argmax(logits, dim=-1)
+        else:
+            action = dist.sample()
+        log_prob = dist.log_prob(action)
         entropy = dist.entropy()
+        return action, action, log_prob, entropy, value
 
-        return log_probs, values.squeeze(-1), entropy
+    def get_action(self, obs_dict, deterministic: bool = False):
+        """Utility used by evaluation helpers."""
+        if isinstance(obs_dict, dict):
+            obs = obs_dict['observation']
+        else:
+            obs = obs_dict
+        device = next(self.parameters()).device
+        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)
+        with torch.no_grad():
+            action, _, _, _, _ = self.act(obs_tensor, deterministic=deterministic)
+        if self.action_type == "continuous":
+            return action.squeeze(0).cpu().numpy()
+        return int(action.item())
+
+    def evaluate_actions(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        features = self.shared(obs)
+        value = self.critic(features).squeeze(-1)
+
+        if self.action_type == "continuous":
+            mean = self.actor_mean(features)
+            log_std = self.log_std.expand_as(mean)
+            std = torch.exp(log_std)
+            dist = Normal(mean, std)
+            log_probs = dist.log_prob(actions).sum(dim=-1)
+            squashed = torch.tanh(actions)
+            log_probs = log_probs - torch.log(1 - squashed.pow(2) + 1e-6).sum(dim=-1)
+            entropy = dist.entropy().sum(dim=-1)
+            return log_probs, value, entropy
+
+        logits = self.actor_logits(features)
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(actions.long())
+        entropy = dist.entropy()
+        return log_probs, value, entropy
 
 
 class RolloutBuffer:
-    """
-    Buffer for storing experience during rollout.
-
-    Now includes action masks for proper action masking during training.
-    """
+    """Buffer for storing experience during rollout."""
 
     def __init__(self):
         self.observations = []
-        self.action_masks = []
         self.actions = []
+        self.raw_actions = []
         self.rewards = []
         self.values = []
         self.log_probs = []
         self.dones = []
 
-    def add(self, obs, action_mask, action, reward, value, log_prob, done):
+    def add(self, obs, action, raw_action, reward, value, log_prob, done):
         self.observations.append(obs)
-        self.action_masks.append(action_mask)
         self.actions.append(action)
+        self.raw_actions.append(raw_action)
         self.rewards.append(reward)
         self.values.append(value)
         self.log_probs.append(log_prob)
@@ -200,8 +193,8 @@ class RolloutBuffer:
 
     def clear(self):
         self.observations.clear()
-        self.action_masks.clear()
         self.actions.clear()
+        self.raw_actions.clear()
         self.rewards.clear()
         self.values.clear()
         self.log_probs.clear()
@@ -210,8 +203,8 @@ class RolloutBuffer:
     def get(self):
         return {
             'observations': np.array(self.observations),
-            'action_masks': np.array(self.action_masks),
             'actions': np.array(self.actions),
+            'raw_actions': np.array(self.raw_actions),
             'rewards': np.array(self.rewards),
             'values': np.array(self.values),
             'log_probs': np.array(self.log_probs),
@@ -221,17 +214,16 @@ class RolloutBuffer:
 
 class PPOAgent:
     """
-    Proximal Policy Optimization agent with action masking.
-
-    - Action masking support
-    - Explained variance metric
-    - Better initialization
+    Proximal Policy Optimization agent supporting both action types.
     """
 
     def __init__(
         self,
         obs_dim: int,
         action_dim: int,
+        action_type: str,
+        action_low: Optional[np.ndarray],
+        action_high: Optional[np.ndarray],
         lr: float = 3e-4,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -248,53 +240,41 @@ class PPOAgent:
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.device = device
+        self.action_type = action_type
 
-        # Create network with orthogonal initialization
-        self.network = ActorCritic(obs_dim, action_dim).to(device)
+        self.network = ActorCritic(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            action_type=action_type,
+            action_low=action_low,
+            action_high=action_high,
+        ).to(device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=lr, eps=1e-5)
 
-        # Buffer
         self.buffer = RolloutBuffer()
 
-    def get_action(self, obs_dict, deterministic=False):
-        """
-        Get action from policy with action masking.
-
-        Args:
-            obs_dict: Dictionary with 'observation' and 'action_mask'
-            deterministic: If True, use argmax instead of sampling
-
-        Returns:
-            action, value, log_prob
-        """
-        # Extract observation and mask
+    def get_action(self, obs_dict, deterministic: bool = False):
         if isinstance(obs_dict, dict):
             obs = obs_dict['observation']
-            action_mask = obs_dict['action_mask']
         else:
             obs = obs_dict
-            action_mask = None
 
         obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
 
-        if action_mask is not None:
-            mask_tensor = torch.FloatTensor(action_mask).unsqueeze(0).to(self.device)
-        else:
-            mask_tensor = None
-
         with torch.no_grad():
-            action_logits, value = self.network(obs_tensor, mask_tensor)
-            probs = torch.softmax(action_logits, dim=-1)
-            dist = Categorical(probs)
+            action, raw_action, log_prob, _, value = self.network.act(
+                obs_tensor,
+                deterministic=deterministic,
+            )
 
-            if deterministic:
-                action = action_logits.argmax(dim=-1)
-            else:
-                action = dist.sample()
+        if self.action_type == "continuous":
+            env_action = action.squeeze(0).cpu().numpy()
+            stored_raw = raw_action.squeeze(0).cpu().numpy()
+        else:
+            env_action = int(action.item())
+            stored_raw = int(raw_action.item())
 
-            log_prob = dist.log_prob(action)
-
-        return action.item(), value.item(), log_prob.item()
+        return env_action, stored_raw, value.item(), log_prob.item()
 
     def compute_gae(self, rewards, values, dones, next_value):
         """Compute Generalized Advantage Estimation."""
@@ -315,7 +295,7 @@ class PPOAgent:
 
     def update(self, next_obs_dict, n_epochs=4, batch_size=64):
         """
-        Update policy using PPO with action masking.
+        Update policy using PPO.
 
         Returns dictionary with training metrics including explained variance.
         """
@@ -325,22 +305,15 @@ class PPOAgent:
         # Get rollout data
         data = self.buffer.get()
 
-        # Extract next observation and mask
         if isinstance(next_obs_dict, dict):
             next_obs = next_obs_dict['observation']
-            next_mask = next_obs_dict['action_mask']
         else:
             next_obs = next_obs_dict
-            next_mask = None
 
         # Compute next value
         with torch.no_grad():
             next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
-            if next_mask is not None:
-                next_mask_tensor = torch.FloatTensor(next_mask).unsqueeze(0).to(self.device)
-            else:
-                next_mask_tensor = None
-            _, next_value = self.network(next_obs_tensor, next_mask_tensor)
+            _, _, _, _, next_value = self.network.act(next_obs_tensor, deterministic=True)
             next_value = next_value.item()
 
         # Compute advantages and returns
@@ -353,8 +326,10 @@ class PPOAgent:
 
         # Convert to tensors
         obs_tensor = torch.FloatTensor(data['observations']).to(self.device)
-        mask_tensor = torch.FloatTensor(data['action_masks']).to(self.device)
-        actions_tensor = torch.LongTensor(data['actions']).to(self.device)
+        if self.action_type == "continuous":
+            action_tensor = torch.FloatTensor(data['raw_actions']).to(self.device)
+        else:
+            action_tensor = torch.LongTensor(data['actions']).to(self.device)
         old_log_probs_tensor = torch.FloatTensor(data['log_probs']).to(self.device)
         advantages_tensor = torch.FloatTensor(advantages).to(self.device)
         returns_tensor = torch.FloatTensor(returns).to(self.device)
@@ -382,16 +357,14 @@ class PPOAgent:
 
                 # Get batch
                 obs_batch = obs_tensor[batch_indices]
-                mask_batch = mask_tensor[batch_indices]
-                actions_batch = actions_tensor[batch_indices]
+                actions_batch = action_tensor[batch_indices]
                 old_log_probs_batch = old_log_probs_tensor[batch_indices]
                 advantages_batch = advantages_tensor[batch_indices]
                 returns_batch = returns_tensor[batch_indices]
                 old_values_batch = old_values_tensor[batch_indices]
 
-                # Evaluate actions with masks
                 log_probs, values, entropy = self.network.evaluate_actions(
-                    obs_batch, actions_batch, mask_batch
+                    obs_batch, actions_batch
                 )
 
                 # Policy loss (clipped surrogate objective)
@@ -456,7 +429,6 @@ class IPPOTrainer:
     Independent PPO Trainer for multi-agent environment.
 
     - TensorBoard logging
-    - Action masking support
     - Learning rate annealing
     - Explained variance tracking
     """
@@ -489,16 +461,32 @@ class IPPOTrainer:
 
         # Create PPO agent for each company
         self.agents: Dict[str, PPOAgent] = {}
+        self._default_observations: Dict[str, np.ndarray] = {}
 
         for agent_name in env.possible_agents:
             # Get observation dimension from the Box space inside Dict
             obs_space = env.observation_space(agent_name)
             obs_dim = obs_space.spaces['observation'].shape[0]
-            action_dim = env.action_space(agent_name).n
+            action_space = env.action_space(agent_name)
+            if isinstance(action_space, GymBox):
+                action_type = "continuous"
+                action_dim = int(np.prod(action_space.shape))
+                action_low = action_space.low
+                action_high = action_space.high
+            elif isinstance(action_space, GymDiscrete):
+                action_type = "discrete"
+                action_dim = action_space.n
+                action_low = None
+                action_high = None
+            else:
+                raise NotImplementedError("Unsupported action space type")
 
             self.agents[agent_name] = PPOAgent(
                 obs_dim=obs_dim,
                 action_dim=action_dim,
+                action_type=action_type,
+                action_low=action_low,
+                action_high=action_high,
                 lr=lr,
                 gamma=gamma,
                 gae_lambda=gae_lambda,
@@ -508,6 +496,7 @@ class IPPOTrainer:
                 max_grad_norm=max_grad_norm,
                 device=device
             )
+            self._default_observations[agent_name] = np.zeros(obs_dim, dtype=np.float32)
 
         # Setup run directory
         if run_name is None:
@@ -531,9 +520,10 @@ class IPPOTrainer:
                 'g0': env.g0,
                 'g1': env.g1,
                 'base_firing_cost': env.base_firing_cost,
-                'base_hiring_cost': env.base_hiring_cost,
                 'base_screening_cost': env.base_screening_cost,
-                'worker_bargaining_power': env.worker_bargaining_power,
+                'max_interview_cost': env.max_interview_cost,
+                'num_interview_cost_levels': env.num_interview_cost_levels,
+                'action_mode': env.action_mode,
                 'max_timesteps': env.max_timesteps,
             },
             'training': {
@@ -603,7 +593,7 @@ class IPPOTrainer:
         self._step_log_buffer.clear()
 
     def collect_rollout(self, n_steps: int):
-        """Collect n_steps of experience for each agent with action masking."""
+        """Collect n_steps of experience for each agent."""
         observations, _ = self.env.reset()
 
         # Track episode returns
@@ -615,14 +605,23 @@ class IPPOTrainer:
             actions = {}
             values = {}
             log_probs = {}
+            raw_actions = {}
 
             for agent_name in self.env.agents:
-                action, value, log_prob = self.agents[agent_name].get_action(
+                agent = self.agents[agent_name]
+                env_action, raw_action, value, log_prob = agent.get_action(
                     observations[agent_name]
                 )
-                actions[agent_name] = action
+                if agent.action_type == "continuous":
+                    action_value = float(np.asarray(env_action).reshape(-1)[0])
+                    stored_raw = np.asarray(raw_action)
+                else:
+                    action_value = int(env_action)
+                    stored_raw = int(raw_action)
+                actions[agent_name] = action_value
                 values[agent_name] = value
                 log_probs[agent_name] = log_prob
+                raw_actions[agent_name] = stored_raw
 
             # Step environment
             next_observations, rewards, terminations, truncations, infos = self.env.step(actions)
@@ -639,12 +638,11 @@ class IPPOTrainer:
 
                 # Extract observation and mask
                 obs = observations[agent_name]['observation']
-                mask = observations[agent_name]['action_mask']
 
                 self.agents[agent_name].buffer.add(
                     obs=obs,
-                    action_mask=mask,
                     action=actions[agent_name],
+                    raw_action=raw_actions[agent_name],
                     reward=rewards[agent_name],
                     value=values[agent_name],
                     log_prob=log_probs[agent_name],
@@ -690,7 +688,8 @@ class IPPOTrainer:
         n_epochs: int = 4,
         batch_size: int = 64,
         log_interval: int = 10,
-        save_interval: int = 100
+        save_interval: int = 100,
+        save_path: Optional[str] = None,
     ):
         """
         Train all agents using Independent PPO.
@@ -702,7 +701,7 @@ class IPPOTrainer:
         - Action masking
         """
         # Create checkpoint directory
-        checkpoint_dir = f"{self.run_dir}/checkpoints"
+        checkpoint_dir = save_path or f"{self.run_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         n_updates = total_timesteps // n_steps
@@ -726,11 +725,9 @@ class IPPOTrainer:
             # Update all agents
             update_stats = {}
             for agent_name in self.env.possible_agents:
+                fallback_obs = {'observation': self._default_observations[agent_name]}
                 stats = self.agents[agent_name].update(
-                    next_obs_dict=next_observations.get(agent_name, {
-                        'observation': np.zeros(self.agents[agent_name].network.shared[0].in_features),
-                        'action_mask': np.ones(self.agents[agent_name].network.actor.out_features)
-                    }),
+                    next_obs_dict=next_observations.get(agent_name, fallback_obs),
                     n_epochs=n_epochs,
                     batch_size=batch_size
                 )
@@ -851,7 +848,7 @@ def main():
         num_companies=1,
         num_workers=10,
         max_workers_per_company=5,
-        max_timesteps=100,
+        max_timesteps=10,
         seed=seed
     )
 

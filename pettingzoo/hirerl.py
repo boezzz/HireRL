@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Dict, Tuple, Any, Optional, List
 
 import numpy as np
-from gymnasium.spaces import Discrete, Box, Dict as GymDict, MultiBinary
+from gymnasium.spaces import Box, Dict as GymDict, MultiBinary, Discrete
 from pettingzoo.utils.env import ParallelEnv
 
 from workers import WorkerPool
@@ -54,6 +54,7 @@ class JobMarketEnv(ParallelEnv):
         base_screening_cost: float = 0.5,
         max_interview_cost: float = 2.0,
         num_interview_cost_levels: int = 5,
+        action_mode: str = "continuous",
         profit_theta: float = 0.05,
         profit_noise_var: float = 0.1,
         profit_function_type: str = "linear",
@@ -79,6 +80,9 @@ class JobMarketEnv(ParallelEnv):
         self.base_screening_cost = base_screening_cost
         self.max_interview_cost = max_interview_cost
         self.num_interview_cost_levels = max(2, num_interview_cost_levels)
+        self.action_mode = action_mode.lower()
+        if self.action_mode not in {"continuous", "discrete"}:
+            raise ValueError("action_mode must be 'continuous' or 'discrete'")
 
         self.wage_profit_share = wage_profit_share
         self.initial_offer_vx = float(np.clip(initial_offer_vx, 0.0, 0.99))
@@ -120,16 +124,32 @@ class JobMarketEnv(ParallelEnv):
         self._interview_vars = _init_matrix(base_var)
         self._last_profit = _init_matrix(0.0)
 
-        # Action space: choose among discrete interview costs
         self.cost_levels = np.linspace(
             0.0,
             self.max_interview_cost,
             self.num_interview_cost_levels,
             dtype=np.float32,
         )
-        self.idle_action = 0
-        self.action_size = self.num_interview_cost_levels
-        self._action_spaces = {agent: Discrete(self.action_size) for agent in self.agents}
+
+        if self.action_mode == "continuous":
+            self.action_low = 0.0
+            self.action_high = float(self.max_interview_cost)
+            self.action_size = 1
+            self.idle_action = None
+            self._action_spaces = {
+                agent: Box(
+                    low=np.array([self.action_low], dtype=np.float32),
+                    high=np.array([self.action_high], dtype=np.float32),
+                    dtype=np.float32,
+                )
+                for agent in self.agents
+            }
+        else:
+            self.action_low = 0.0
+            self.action_high = float(self.max_interview_cost)
+            self.action_size = self.num_interview_cost_levels
+            self.idle_action = 0
+            self._action_spaces = {agent: Discrete(self.action_size) for agent in self.agents}
 
         obs_size = (
             num_workers * ability_dim  # sigma_hat
@@ -210,9 +230,15 @@ class JobMarketEnv(ParallelEnv):
 
         return assignments
 
-    def _cost_from_action(self, action: int) -> float:
-        action = int(np.clip(action, 0, self.action_size - 1))
-        return float(self.cost_levels[action])
+    def _cost_from_action(self, action: Any) -> float:
+        if self.action_mode == "discrete":
+            idx = int(np.clip(int(action), 0, self.action_size - 1))
+            return float(self.cost_levels[idx])
+        if isinstance(action, (list, tuple, np.ndarray)):
+            value = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
+        else:
+            value = float(action)
+        return float(np.clip(value, self.action_low, self.action_high))
 
     def _compute_vx(self, exp_t: float, delta_interview_sq: float) -> float:
         exp_t = max(0.0, float(exp_t))
@@ -248,6 +274,9 @@ class JobMarketEnv(ParallelEnv):
                 worker.wage = result.wage_t
 
     def _generate_action_mask(self, agent: str) -> np.ndarray:
+        if self.action_mode == "continuous":
+            return np.ones(self.action_size, dtype=np.int8)
+
         assignments = self._deterministic_interview_assignments()
         company_idx = self._company_index(agent)
         mask = np.zeros(self.action_size, dtype=np.int8)
@@ -358,7 +387,10 @@ class JobMarketEnv(ParallelEnv):
         Dict[str, bool],
         Dict[str, Dict[str, Any]],
     ]:
-        decoded_actions = {agent: int(actions.get(agent, self.idle_action)) for agent in self.agents}
+        decoded_actions: Dict[str, float] = {}
+        for agent in self.agents:
+            default = 0 if self.action_mode == "discrete" else 0.0
+            decoded_actions[agent] = self._cost_from_action(actions.get(agent, default))
 
         prev_state = [
             {
@@ -387,7 +419,7 @@ class JobMarketEnv(ParallelEnv):
 
             worker_id = assignments[company_idx]
             worker = self.worker_pool.workers[worker_id]
-            cost = self._cost_from_action(decoded_actions[agent])
+            cost = decoded_actions[agent]
 
             screening_costs[agent] += cost
 

@@ -14,24 +14,42 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 
-class RandomPolicy:
-    """Random action selection (uniform over valid actions with action masking)."""
+def _quantize_action(cost: float, action_mode: str, cost_levels: np.ndarray, max_cost: float):
+    """Map target cost to env action."""
+    cost_clamped = float(np.clip(cost, 0.0, max_cost))
+    if action_mode == "discrete":
+        idx = int(np.argmin(np.abs(cost_levels - cost_clamped)))
+        return int(idx)
+    return cost_clamped
 
-    def __init__(self, num_workers: int, seed: Optional[int] = None):
+
+class RandomPolicy:
+    """Randomly sample an interview cost (continuous or discrete)."""
+
+    def __init__(
+        self,
+        num_workers: int,
+        max_interview_cost: float = 2.0,
+        num_interview_cost_levels: int = 5,
+        action_mode: str = "continuous",
+        seed: Optional[int] = None,
+    ):
         self.num_workers = num_workers
-        self.action_space_size = 1 + 3 * num_workers
+        self.max_interview_cost = float(max_interview_cost)
+        self.action_mode = action_mode.lower()
+        self.cost_levels = np.linspace(
+            0.0,
+            self.max_interview_cost,
+            max(2, num_interview_cost_levels),
+            dtype=np.float32,
+        )
         self.rng = np.random.RandomState(seed)
 
-    def get_action(self, observation: Dict, agent: str) -> int:
-        """Sample random action from valid actions only."""
-        # Handle dict observation format (with action masking)
-        if isinstance(observation, dict):
-            action_mask = observation['action_mask']
-            valid_actions = [i for i, valid in enumerate(action_mask) if valid == 1]
-            return self.rng.choice(valid_actions) if valid_actions else 0
-        else:
-            # Fallback for old format
-            return self.rng.randint(0, self.action_space_size)
+    def get_action(self, observation: Dict, agent: str) -> float:
+        """Sample a random cost or discrete level."""
+        if self.action_mode == "discrete":
+            return int(self.rng.randint(0, len(self.cost_levels)))
+        return float(self.rng.rand() * self.max_interview_cost)
 
 
 class GreedyPolicy:
@@ -48,9 +66,31 @@ class GreedyPolicy:
         self,
         num_workers: int,
         ability_dim: int = 1,
+        max_interview_cost: float = 2.0,
+        num_interview_cost_levels: int = 5,
+        action_mode: str = "continuous",
     ):
         self.num_workers = num_workers
         self.ability_dim = ability_dim
+        self.max_interview_cost = float(max_interview_cost)
+        self.action_mode = action_mode.lower()
+        self.cost_levels = np.linspace(
+            0.0,
+            self.max_interview_cost,
+            max(2, num_interview_cost_levels),
+            dtype=np.float32,
+        )
+
+    def _compute_expected_profit(self, worker_id: int, parsed: Dict[str, np.ndarray]) -> float:
+        """
+        Simple heuristic for expected profit based on beliefs, wages, and experience.
+        """
+        expected_signal = parsed['belief_mean'][worker_id, 0]
+        wage = parsed['wages'][worker_id]
+        experience = parsed['experience'][worker_id]
+        tenure = parsed['tenure'][worker_id]
+        # Reward high signals, penalize wages, and reward workers with low tenure (less costly)
+        return float(expected_signal - wage + 0.1 * experience - 0.05 * tenure)
 
     def _parse_observation(
         self, obs: np.ndarray
@@ -112,23 +152,15 @@ class GreedyPolicy:
         }
 
 
-    def get_action(self, observation, agent: str) -> int:
+    def get_action(self, observation, agent: str) -> float:
         """
         Select a greedy interview-cost action.
-
-        In the current environment, firms do not directly choose which worker
-        to hire or fire. Instead, each firm's discrete action controls how much
-        to invest in interviewing (screening) the worker assigned to it by the
-        deterministic interview mechanism in the environment.
 
         Logic:
         1. Parse observation and compute expected profit proxies for workers.
         2. Look at unemployed workers: if there is high expected surplus, invest
            more in screening; otherwise, invest little or nothing.
-        3. Map this intensity choice into a discrete action using the action_mask:
-           - smallest valid index   -> interpreted as "no-op" / lowest cost
-           - largest valid index    -> interpreted as "highest cost"
-           - a middle valid index   -> medium cost (if available)
+        3. Map this intensity choice into a continuous cost in [0, max_interview_cost].
         """
         # Handle dict observation format and extract action_mask
         if isinstance(observation, dict):
@@ -155,119 +187,74 @@ class GreedyPolicy:
         else:
             max_exp_profit = 0.0
 
-        # Determine valid discrete actions
-        if action_mask is not None:
-            valid_actions = [i for i, v in enumerate(action_mask) if v == 1]
-        else:
-            # Fallback: assume a small fixed action space: {0,1,2,3}
-            valid_actions = list(range(4))
-
-        if not valid_actions:
-            return 0
-
-        valid_actions_sorted = sorted(valid_actions)
-        no_op_action = valid_actions_sorted[0]
-        highest_cost_action = valid_actions_sorted[-1]
-        if len(valid_actions_sorted) >= 3:
-            mid_idx = len(valid_actions_sorted) // 2
-            mid_cost_action = valid_actions_sorted[mid_idx]
-        else:
-            mid_cost_action = highest_cost_action
-
-        # Heuristic mapping from expected profit to interview intensity
         if max_exp_profit <= 0.0:
-            # No promising unemployed workers: do nothing / lowest cost
-            return no_op_action
+            cost_choice = 0.0
         elif max_exp_profit < 1.0:
-            # Moderate opportunity: invest medium screening cost
-            return mid_cost_action
+            cost_choice = 0.5 * self.max_interview_cost
         else:
-            # High expected surplus: invest highest available screening cost
-            return highest_cost_action
+            cost_choice = self.max_interview_cost
+
+        return _quantize_action(cost_choice, self.action_mode, self.cost_levels, self.max_interview_cost)
 
 
 class NoScreeningPolicy:
     """
-    Greedy policy that never screens (relies on public signals only).
-
-    This tests the value of screening.
-    """
-
-    def __init__(
-        self,
-        num_workers: int,
-        ability_dim: int = 1
-    ):
-        self.greedy_policy = GreedyPolicy(
-            num_workers, ability_dim
-        )
-        self.num_workers = num_workers
-
-    def get_action(self, observation, agent: str) -> int:
-        """Never invest in screening: always choose the lowest-cost/no-op action."""
-        if isinstance(observation, dict):
-            action_mask = observation.get('action_mask', None)
-        else:
-            action_mask = None
-
-        if action_mask is not None:
-            valid_actions = [i for i, v in enumerate(action_mask) if v == 1]
-            if valid_actions:
-                return min(valid_actions)
-            return 0
-        # Fallback: assume action 0 is no-op
-        return 0
-
-
-class HighScreeningPolicy:
-    """
-    Policy that always screens workers before hiring.
-
-    Strategy:
-    - Interview unemployed workers to update beliefs
-    - Then use greedy hiring based on updated beliefs
+    Policy that never spends on interviews (relies on public signals only).
     """
 
     def __init__(
         self,
         num_workers: int,
         ability_dim: int = 1,
+        max_interview_cost: float = 2.0,
+        num_interview_cost_levels: int = 5,
+        action_mode: str = "continuous",
+    ):
+        self.num_workers = num_workers
+        self.ability_dim = ability_dim
+        self.max_interview_cost = float(max_interview_cost)
+        self.action_mode = action_mode.lower()
+        self.cost_levels = np.linspace(
+            0.0,
+            self.max_interview_cost,
+            max(2, num_interview_cost_levels),
+            dtype=np.float32,
+        )
+
+    def get_action(self, observation, agent: str) -> float:
+        return _quantize_action(0.0, self.action_mode, self.cost_levels, self.max_interview_cost)
+
+
+class HighScreeningPolicy:
+    """
+    Policy that frequently allocates the maximum interview cost.
+    """
+
+    def __init__(
+        self,
+        num_workers: int,
+        ability_dim: int = 1,
+        max_interview_cost: float = 2.0,
+        num_interview_cost_levels: int = 5,
+        action_mode: str = "continuous",
         seed: Optional[int] = None
     ):
         self.greedy_policy = GreedyPolicy(
-            num_workers, ability_dim
+            num_workers, ability_dim, max_interview_cost, num_interview_cost_levels, action_mode
         )
-        self.num_workers = num_workers
+        self.max_interview_cost = float(max_interview_cost)
+        self.action_mode = action_mode.lower()
+        self.cost_levels = np.linspace(
+            0.0,
+            self.max_interview_cost,
+            max(2, num_interview_cost_levels),
+            dtype=np.float32,
+        )
         self.rng = np.random.RandomState(seed)
 
-    def get_action(self, observation, agent: str) -> int:
-        """
-        With some probability, choose a high screening cost.
-        Otherwise, use the greedy cost-based policy.
-        """
-        # Handle dict observation format
-        if isinstance(observation, dict):
-            action_mask = observation.get('action_mask', None)
-        else:
-            action_mask = None
-
-        if action_mask is not None:
-            valid_actions = [i for i, v in enumerate(action_mask) if v == 1]
-        else:
-            valid_actions = list(range(4))
-
-        if not valid_actions:
-            return 0
-
-        valid_actions_sorted = sorted(valid_actions)
-        no_op_action = valid_actions_sorted[0]
-        highest_cost_action = valid_actions_sorted[-1]
-
-        # 30% chance to choose the highest screening cost
+    def get_action(self, observation, agent: str) -> float:
         if self.rng.rand() < 0.3:
-            return highest_cost_action
-
-        # Otherwise, fall back to greedy cost choice
+            return _quantize_action(self.max_interview_cost, self.action_mode, self.cost_levels, self.max_interview_cost)
         return self.greedy_policy.get_action(observation, agent)
 
 
@@ -281,14 +268,17 @@ class NeverFirePolicy:
     def __init__(
         self,
         num_workers: int,
-        ability_dim: int = 1
+        ability_dim: int = 1,
+        max_interview_cost: float = 2.0,
+        num_interview_cost_levels: int = 5,
+        action_mode: str = "continuous",
     ):
         self.greedy_policy = GreedyPolicy(
-            num_workers, ability_dim
+            num_workers, ability_dim, max_interview_cost, num_interview_cost_levels, action_mode
         )
         self.num_workers = num_workers
 
-    def get_action(self, observation, agent: str) -> int:
+    def get_action(self, observation, agent: str) -> float:
         """Get action; firing is now handled by the environment's rule."""
         return self.greedy_policy.get_action(observation, agent)
 
@@ -308,40 +298,42 @@ class HeuristicPolicy:
         self,
         num_workers: int,
         ability_dim: int = 1,
+        max_interview_cost: float = 2.0,
+        num_interview_cost_levels: int = 5,
+        action_mode: str = "continuous",
         target_workforce_ratio: float = 0.8,
         screening_threshold: float = 0.5
     ):
         self.num_workers = num_workers
         self.ability_dim = ability_dim
+        self.max_interview_cost = float(max_interview_cost)
+        self.action_mode = action_mode.lower()
+        self.cost_levels = np.linspace(
+            0.0,
+            self.max_interview_cost,
+            max(2, num_interview_cost_levels),
+            dtype=np.float32,
+        )
         self.target_workforce = target_workforce_ratio
         self.screening_threshold = screening_threshold
 
         self.greedy_policy = GreedyPolicy(
-            num_workers, ability_dim
+            num_workers, ability_dim, max_interview_cost, num_interview_cost_levels, action_mode
         )
 
-    def get_action(self, observation, agent: str) -> int:
+    def get_action(self, observation, agent: str) -> float:
         """
         Heuristic decision making over interview cost levels.
-
-        Priority:
-        1. If there exist unemployed workers with high public signal and high
-           uncertainty, invest in higher-cost screening.
-        2. Otherwise, use the greedy cost-based policy.
         """
-        # Handle dict observation format
         if isinstance(observation, dict):
             obs_array = observation['observation']
-            action_mask = observation.get('action_mask', None)
         else:
             obs_array = observation
-            action_mask = None
 
         parsed = self.greedy_policy._parse_observation(obs_array)
 
         unemployed_ids = [i for i in range(self.num_workers) if parsed['employed_by'][i] < 0]
 
-        # Determine candidate workers for extra screening
         high_uncertainty_candidates = []
         for i in unemployed_ids:
             variance = parsed['belief_var'][i, 0]  # Assuming d=1
@@ -349,29 +341,12 @@ class HeuristicPolicy:
             if sigma_hat > 0.5 and variance > self.screening_threshold:
                 high_uncertainty_candidates.append(i)
 
-        # Determine valid actions
-        if action_mask is not None:
-            valid_actions = [i for i, v in enumerate(action_mask) if v == 1]
-        else:
-            valid_actions = list(range(4))
-
-        if not valid_actions:
-            return 0
-
-        valid_actions_sorted = sorted(valid_actions)
-        no_op_action = valid_actions_sorted[0]
-        highest_cost_action = valid_actions_sorted[-1]
-        if len(valid_actions_sorted) >= 3:
-            mid_idx = len(valid_actions_sorted) // 2
-            mid_cost_action = valid_actions_sorted[mid_idx]
-        else:
-            mid_cost_action = highest_cost_action
-
         if high_uncertainty_candidates:
-            # If there are promising but uncertain workers, use a higher screening cost
-            return mid_cost_action if len(high_uncertainty_candidates) == 1 else highest_cost_action
+            if len(high_uncertainty_candidates) >= 2:
+                return _quantize_action(self.max_interview_cost, self.action_mode, self.cost_levels, self.max_interview_cost)
+            mid_cost = 0.5 * self.max_interview_cost
+            return _quantize_action(mid_cost, self.action_mode, self.cost_levels, self.max_interview_cost)
 
-        # Otherwise use greedy cost-based policy
         return self.greedy_policy.get_action(observation, agent)
 
 
@@ -389,27 +364,28 @@ def create_policy(policy_name: str, env_config: Dict) -> object:
         Policy object with get_action(observation, agent) method
     """
     num_workers = env_config['num_workers']
-    num_companies = env_config['num_companies']
-    max_workers = env_config['max_workers_per_company']
     ability_dim = env_config.get('ability_dim', 1)
+    max_interview_cost = env_config.get('max_interview_cost', 2.0)
+    num_cost_levels = env_config.get('num_interview_cost_levels', 5)
+    action_mode = env_config.get('action_mode', 'continuous')
 
     if policy_name == 'random':
-        return RandomPolicy(num_workers)
+        return RandomPolicy(num_workers, max_interview_cost, num_cost_levels, action_mode)
 
     elif policy_name == 'greedy':
-        return GreedyPolicy(num_workers, ability_dim)
+        return GreedyPolicy(num_workers, ability_dim, max_interview_cost, num_cost_levels, action_mode)
 
     elif policy_name == 'no_screening':
-        return NoScreeningPolicy(num_workers, ability_dim)
+        return NoScreeningPolicy(num_workers, ability_dim, max_interview_cost, num_cost_levels, action_mode)
 
     elif policy_name == 'high_screening':
-        return HighScreeningPolicy(num_workers, ability_dim)
+        return HighScreeningPolicy(num_workers, ability_dim, max_interview_cost, num_cost_levels, action_mode)
 
     elif policy_name == 'never_fire':
-        return NeverFirePolicy(num_workers, ability_dim)
+        return NeverFirePolicy(num_workers, ability_dim, max_interview_cost, num_cost_levels, action_mode)
 
     elif policy_name == 'heuristic':
-        return HeuristicPolicy(num_workers, ability_dim)
+        return HeuristicPolicy(num_workers, ability_dim, max_interview_cost, num_cost_levels, action_mode)
 
     else:
         raise ValueError(f"Unknown policy: {policy_name}")

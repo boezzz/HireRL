@@ -20,19 +20,29 @@ def test_ppo_agent_creation():
     print("TEST: PPO Agent Creation")
     print("="*60)
 
-    agent = PPOAgent(obs_dim=41, action_dim=16, device='cpu')
+    action_low = np.array([0.0], dtype=np.float32)
+    action_high = np.array([2.0], dtype=np.float32)
+    agent = PPOAgent(
+        obs_dim=41,
+        action_dim=1,
+        action_type='continuous',
+        action_low=action_low,
+        action_high=action_high,
+        device='cpu'
+    )
 
     print(f"✓ Created PPO agent")
     print(f"  Observation dim: 41")
-    print(f"  Action dim: 16")
+    print(f"  Action dim: 1")
     print(f"  Network parameters: {sum(p.numel() for p in agent.network.parameters()):,}")
 
     # Test forward pass
     obs = np.random.randn(41).astype(np.float32)
-    action, value, log_prob = agent.get_action(obs)
+    action, raw_action, value, log_prob = agent.get_action(obs)
 
     print(f"✓ Forward pass successful")
-    print(f"  Sample action: {action}")
+    print(f"  Sample action: {float(np.asarray(action).reshape(-1)[0]):.4f}")
+    print(f"  Raw action: {float(np.asarray(raw_action).reshape(-1)[0]):.4f}")
     print(f"  Value estimate: {value:.4f}")
     print(f"  Log prob: {log_prob:.4f}")
 
@@ -97,7 +107,7 @@ def test_ppo_update():
     # Perform update
     for agent_name, agent in trainer.agents.items():
         stats = agent.update(
-            next_obs=next_obs[agent_name],
+            next_obs_dict=next_obs[agent_name],
             n_epochs=2,
             batch_size=16
         )

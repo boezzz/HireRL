@@ -99,9 +99,10 @@ def test_greedy_policy():
 
     policy = GreedyPolicy(
         num_workers=5,
-        num_companies=2,
-        max_workers_per_company=3,
-        ability_dim=1
+        ability_dim=1,
+        max_interview_cost=env.max_interview_cost,
+        num_interview_cost_levels=env.num_interview_cost_levels,
+        action_mode=env.action_mode
     )
 
     logger = EpisodeLogger(env.agents)
@@ -176,22 +177,23 @@ def test_screening():
     print("TEST 5: Screening Mechanism")
     print("="*60)
 
-    from screening import ScreeningMechanism, ScreeningTechnology
+    from interview0 import ScreeningMechanism
 
     screening = ScreeningMechanism(
-        technology=ScreeningTechnology.SQRT,
-        c_max=1.0,
+        delta0_sq=1.0,
+        lam=1.0,
         seed=42
     )
 
-    # Test precision function
+    # Test precision implied by interview variance
     costs = [0.0, 0.1, 0.5, 1.0, 2.0]
-    print("Cost-Precision Relationship:")
+    print("Cost-Variance Relationship:")
     for c in costs:
-        precision = screening.get_precision(c)
-        print(f"  Cost = {c:.2f} -> Precision = {precision:.3f}")
+        var = screening.interview_var(c)
+        precision = 1.0 - var / screening.delta0_sq
+        print(f"  Cost = {c:.2f} -> Var = {var:.3f}, Precision = {precision:.3f}")
 
-    # Test screening
+    # Test screening draws
     sigma_true = np.array([1.5], dtype=np.float32)
     sigma_hat_0 = np.array([1.0], dtype=np.float32)
 
@@ -206,6 +208,33 @@ def test_screening():
     return True
 
 
+def test_discrete_action_mode():
+    """Ensure discrete interview-cost mode works."""
+    print("\n" + "="*60)
+    print("TEST 6: Discrete Action Mode")
+    print("="*60)
+
+    env = JobMarketEnv(
+        num_companies=2,
+        num_workers=4,
+        max_workers_per_company=2,
+        max_timesteps=10,
+        num_interview_cost_levels=4,
+        action_mode="discrete",
+        seed=7
+    )
+
+    observations, infos = env.reset()
+    for step in range(5):
+        actions = {agent: 0 for agent in env.agents}
+        observations, rewards, terminations, truncations, infos = env.step(actions)
+        if all(terminations.values()) or all(truncations.values()):
+            break
+
+    print("\n✓ TEST 6 PASSED\n")
+    return True
+
+
 def main():
     """Run all tests."""
     print("\n" + "="*70)
@@ -217,7 +246,8 @@ def main():
         test_random_policy,
         test_greedy_policy,
         test_worker_pool,
-        test_screening
+        test_screening,
+        test_discrete_action_mode
     ]
 
     results = []

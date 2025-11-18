@@ -258,11 +258,15 @@ def print_environment_info(env):
     print(f"")
     print(f"Costs:")
     print(f"  Firing cost: {env.base_firing_cost}")
-    print(f"  Hiring cost: {env.base_hiring_cost}")
     print(f"  Screening cost: {env.base_screening_cost}")
+    print(f"  Max interview cost: {env.max_interview_cost}")
     print(f"")
-    print(f"Market Parameters:")
-    print(f"  Worker bargaining power: {env.worker_bargaining_power}")
+    print(f"Action Space:")
+    print(f"  Mode: {env.action_mode}")
+    if env.action_mode == "continuous":
+        print(f"  Interview cost in [{env.action_low:.2f}, {env.action_high:.2f}]")
+    else:
+        print(f"  {env.action_size} discrete levels up to cost {env.max_interview_cost:.2f}")
     print(f"  Max timesteps: {env.max_timesteps}")
     print(f"")
     print(f"Spaces:")

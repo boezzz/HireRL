@@ -178,9 +178,10 @@ def main():
         'g0': 0.1,
         'g1': 0.05,
         'base_firing_cost': 0.1,
-        'base_hiring_cost': 0.2,
         'base_screening_cost': 0.5,
-        'worker_bargaining_power': 0.6,
+        'max_interview_cost': 2.0,
+        'num_interview_cost_levels': 5,
+        'action_mode': 'continuous',
         'max_timesteps': 50,
         'seed': 42
     }
