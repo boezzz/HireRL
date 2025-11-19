@@ -852,6 +852,15 @@ def main():
         seed=seed
     )
 
+    env.set_module_toggles(
+        wage_adjustment=False,
+        interview=True,
+        matching=False,
+        production=False,
+        experience=False,
+        firing=False,
+    )
+
     # Create trainer with unique run name
     import datetime
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

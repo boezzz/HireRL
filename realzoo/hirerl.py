@@ -61,6 +61,7 @@ class JobMarketEnv(ParallelEnv):
         wage_profit_share: float = 0.5,
         initial_offer_vx: float = 0.0,
         max_timesteps: int = 100,
+        module_toggles: Optional[Dict[str, bool]] = None,
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
     ):
@@ -103,8 +104,19 @@ class JobMarketEnv(ParallelEnv):
         self.screening = ScreeningMechanism(
             delta0_sq=1.0,
             lam=1.0,
-            seed=seed,
         )
+
+        default_modules = {
+            "wage_adjustment": True,
+            "interview": True,
+            "matching": True,
+            "production": True,
+            "experience": True,
+            "firing": True,
+        }
+        if module_toggles:
+            default_modules.update(module_toggles)
+        self.module_toggles = default_modules
 
         self.agents = [f"company_{i}" for i in range(num_companies)]
         self.possible_agents = self.agents.copy()
@@ -239,7 +251,6 @@ class JobMarketEnv(ParallelEnv):
             value = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
         else:
             value = float(action)
-        print(float(np.clip(value, self.action_low, self.action_high)))
         return float(np.clip(value, self.action_low, self.action_high))
 
     def _compute_vx(self, exp_t: float, delta_interview_sq: float) -> float:
@@ -318,6 +329,12 @@ class JobMarketEnv(ParallelEnv):
             "observation": obs,
             "action_mask": self._generate_action_mask(agent),
         }
+
+    def set_module_toggles(self, **overrides: bool) -> None:
+        """Enable or disable pipeline modules (interview, matching, etc.)."""
+        for key, value in overrides.items():
+            if key in self.module_toggles:
+                self.module_toggles[key] = bool(value)
 
     def _get_info(self, agent: str) -> Dict[str, Any]:
         company_idx = self._company_index(agent)
@@ -425,49 +442,49 @@ class JobMarketEnv(ParallelEnv):
             for worker in self.worker_pool.workers
         ]
 
-        # Update wages for continuing employees using last period's profits.
-        # Conceptually, this implements the wage rule
-        #   w_{j,t} = (1 - v_x) g(tilde_sigma_{ij,interview}) + v_x * psi * p_{ij,t-1},
-        # so wages for period t are set at the beginning of period t based on profits from t-1.
-        self._update_wages_existing_employees()
+        if self.module_toggles["wage_adjustment"]:
+            self._update_wages_existing_employees()
 
-        assignments = self._deterministic_interview_assignments()
+        assignments: Dict[int, int] = {}
+        if self.module_toggles["interview"]:
+            assignments = self._deterministic_interview_assignments()
         screening_costs = {agent: 0.0 for agent in self.agents}
         tilde_matrix = np.full((self.num_companies, self.num_workers), -np.inf, dtype=np.float32)
         targeted_workers: set[int] = set()
 
-        for agent in self.agents:
-            company_idx = self._company_index(agent)
-            if company_idx not in assignments:
-                continue
+        if self.module_toggles["interview"]:
+            for agent in self.agents:
+                company_idx = self._company_index(agent)
+                if company_idx not in assignments:
+                    continue
 
-            worker_id = assignments[company_idx]
-            worker = self.worker_pool.workers[worker_id]
-            cost = decoded_actions[agent]
+                worker_id = assignments[company_idx]
+                worker = self.worker_pool.workers[worker_id]
+                cost = decoded_actions[agent]
 
-            screening_costs[agent] += cost
-            self._current_interview_costs[agent][worker_id] = cost
+                screening_costs[agent] += cost
+                self._current_interview_costs[agent][worker_id] = cost
 
-            tilde_sigma, _ = self.screening.screen_worker(
-                sigma_true=worker.sigma_true,
-                sigma_hat_0=worker.sigma_hat,
-                cost=cost,
-            )
-            signal_scalar = float(tilde_sigma[0]) if self.ability_dim == 1 else float(np.mean(tilde_sigma))
-            var_val = self.screening.interview_var(cost)
+                tilde_sigma, _ = self.screening.screen_worker(
+                    sigma_true=worker.sigma_true,
+                    sigma_hat_0=worker.sigma_hat,
+                    cost=cost,
+                )
+                signal_scalar = float(tilde_sigma[0]) if self.ability_dim == 1 else float(np.mean(tilde_sigma))
+                var_val = self.screening.interview_var(cost)
 
-            self.firm_beliefs[agent].initialize_from_interview_signal(
-                worker_id,
-                signal_scalar,
-                signal_noise_var=var_val,
-            )
-            self._interview_signal_at_hire[agent][worker_id] = signal_scalar
-            self._interview_vars[agent][worker_id] = var_val
+                self.firm_beliefs[agent].initialize_from_interview_signal(
+                    worker_id,
+                    signal_scalar,
+                    signal_noise_var=var_val,
+                )
+                self._interview_signal_at_hire[agent][worker_id] = signal_scalar
+                self._interview_vars[agent][worker_id] = var_val
 
-            tilde_matrix[company_idx, worker_id] = signal_scalar
-            targeted_workers.add(worker_id)
+                tilde_matrix[company_idx, worker_id] = signal_scalar
+                targeted_workers.add(worker_id)
 
-        if targeted_workers:
+        if targeted_workers and self.module_toggles["matching"]:
             matching_result = greedy_wage_matching_from_signals(
                 tilde_sigma=tilde_matrix,
                 v_x=self.initial_offer_vx,
@@ -489,72 +506,72 @@ class JobMarketEnv(ParallelEnv):
                     continue
                 self.worker_pool.hire_worker(worker_id, firm_idx, wage_offer)
 
-        # Step 4: production and belief updates
         total_profits = {agent: 0.0 for agent in self.agents}
         total_wages = {agent: 0.0 for agent in self.agents}
 
-        for agent in self.agents:
-            company_idx = self._company_index(agent)
-            workforce = self.worker_pool.get_employed_by_company(company_idx)
+        if self.module_toggles["production"]:
+            for agent in self.agents:
+                company_idx = self._company_index(agent)
+                workforce = self.worker_pool.get_employed_by_company(company_idx)
 
-            for worker_id in workforce:
-                worker = self.worker_pool.workers[worker_id]
-                prev = prev_state[worker_id]
+                for worker_id in workforce:
+                    worker = self.worker_pool.workers[worker_id]
+                    prev = prev_state[worker_id]
 
-                profit = generate_profit(
-                    exp_tm1=prev["experience"],
-                    sigma_j=prev["sigma"],
-                    employed_tm1=prev["employed"],
-                    g0=self.g0,
-                    g1=self.g1,
-                    theta=self.profit_theta,
-                    delta_eps_sq=self.delta_eps_sq,
-                    f_type=self.profit_function_type,
-                    rng=self.rng,
-                )
+                    profit = generate_profit(
+                        exp_tm1=prev["experience"],
+                        sigma_j=prev["sigma"],
+                        employed_tm1=prev["employed"],
+                        g0=self.g0,
+                        g1=self.g1,
+                        theta=self.profit_theta,
+                        delta_eps_sq=self.delta_eps_sq,
+                        f_type=self.profit_function_type,
+                        rng=self.rng,
+                    )
 
-                total_profits[agent] += profit
-                total_wages[agent] += worker.wage
+                    total_profits[agent] += profit
+                    total_wages[agent] += worker.wage
 
-                tilde_sigma_interview = float(self._interview_signal_at_hire[agent][worker_id])
-                delta_interview_sq = float(self._interview_vars[agent][worker_id])
+                    tilde_sigma_interview = float(self._interview_signal_at_hire[agent][worker_id])
+                    delta_interview_sq = float(self._interview_vars[agent][worker_id])
 
-                new_belief, vx = update_belief_from_profit(
-                    tilde_sigma_interview=tilde_sigma_interview,
-                    p_ijt=profit,
-                    exp_t=worker.experience,
-                    delta_interview_sq=delta_interview_sq,
-                    delta_eps_sq=self.delta_eps_sq,
-                )
-                self.firm_beliefs[agent].belief_mean[worker_id, 0] = new_belief
-                self._last_profit[agent][worker_id] = profit
+                    new_belief, vx = update_belief_from_profit(
+                        tilde_sigma_interview=tilde_sigma_interview,
+                        p_ijt=profit,
+                        exp_t=worker.experience,
+                        delta_interview_sq=delta_interview_sq,
+                        delta_eps_sq=self.delta_eps_sq,
+                    )
+                    self.firm_beliefs[agent].belief_mean[worker_id, 0] = new_belief
+                    self._last_profit[agent][worker_id] = profit
 
-        # Experience update occurs after production, before firing
-        self.worker_pool.update_experience_and_tenure()
+        if self.module_toggles["experience"]:
+            self.worker_pool.update_experience_and_tenure()
 
-        # Step 6: firing decision
         firing_costs = {agent: 0.0 for agent in self.agents}
 
-        for agent in self.agents:
-            company_idx = self._company_index(agent)
-            workforce = list(self.worker_pool.get_employed_by_company(company_idx))
+        if self.module_toggles["firing"]:
+            for agent in self.agents:
+                company_idx = self._company_index(agent)
+                workforce = list(self.worker_pool.get_employed_by_company(company_idx))
 
-            for worker_id in workforce:
-                worker = self.worker_pool.workers[worker_id]
-                profit = float(self._last_profit[agent][worker_id])
-                wage_paid = float(worker.wage)
+                for worker_id in workforce:
+                    worker = self.worker_pool.workers[worker_id]
+                    profit = float(self._last_profit[agent][worker_id])
+                    wage_paid = float(worker.wage)
 
-                decision = firing_decision(
-                    p_ijt=profit,
-                    w_ijt=wage_paid,
-                    c_fire_t=self.base_firing_cost,
-                )
+                    decision = firing_decision(
+                        p_ijt=profit,
+                        w_ijt=wage_paid,
+                        c_fire_t=self.base_firing_cost,
+                    )
 
-                if decision.fire:
-                    self.worker_pool.fire_worker(worker_id)
-                    firing_costs[agent] += self.base_firing_cost
-                    self._last_profit[agent][worker_id] = 0.0
-                    self._interview_signal_at_hire[agent][worker_id] = 0.0
+                    if decision.fire:
+                        self.worker_pool.fire_worker(worker_id)
+                        firing_costs[agent] += self.base_firing_cost
+                        self._last_profit[agent][worker_id] = 0.0
+                        self._interview_signal_at_hire[agent][worker_id] = 0.0
 
         rewards = {}
         for agent in self.agents:

@@ -47,23 +47,19 @@ class ScreeningMechanism:
         Optional RNG seed for reproducibility.
     """
 
-    delta0_sq: float = 1.0
-    lam: float = 1.0
-   # seed: Optional[int] = None
-
-    def __post_init__(self) -> None:
-        if self.delta0_sq <= 0:
+    def __init__(self, delta0_sq: float = 1.0, lam: float = 1.0, seed: Optional[int] = None):
+        if delta0_sq <= 0:
             raise ValueError("delta0_sq must be > 0")
-        if self.lam <= 0:
+        if lam <= 0:
             raise ValueError("lam must be > 0")
 
-        # # RNG for reproducible simulations
-        # self._rng: np.random.RandomState
-        # if self.seed is None:
-        #     # Use global RNG
-        #     self._rng = np.random.mtrand._rand  # type: ignore[attr-defined]
-        # else:
-        #     self._rng = np.random.RandomState(self.seed)
+        self.delta0_sq = float(delta0_sq)
+        self.lam = float(lam)
+
+        if seed is None:
+            self._rng = np.random.mtrand._rand  # type: ignore[attr-defined]
+        else:
+            self._rng = np.random.RandomState(seed)
 
     # ------------------------------------------------------------------
     # Cost -> variance map
