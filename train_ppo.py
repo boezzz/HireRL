@@ -848,7 +848,7 @@ def main():
         num_companies=1,
         num_workers=10,
         max_workers_per_company=5,
-        max_timesteps=10,
+        max_timesteps=1000,
         seed=seed
     )
 
@@ -859,7 +859,7 @@ def main():
 
     trainer = IPPOTrainer(
         env=env,
-        lr=3e-4,
+        lr=3e-3,
         gamma=0.99,
         gae_lambda=0.95,
         clip_epsilon=0.2,
@@ -875,14 +875,14 @@ def main():
     trainer.train(
         total_timesteps=1_00,
         n_steps=20,
-        n_epochs=4,
+        n_epochs=100,
         batch_size=20,
         log_interval=5,
         save_interval=5
     )
 
     # Evaluate
-    trainer.evaluate(n_episodes=10, deterministic=True)
+    trainer.evaluate(n_episodes=1000, deterministic=True)
 
 
 if __name__ == '__main__':

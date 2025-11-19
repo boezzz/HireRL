@@ -49,7 +49,7 @@ class ScreeningMechanism:
 
     delta0_sq: float = 1.0
     lam: float = 1.0
-    seed: Optional[int] = None
+   # seed: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.delta0_sq <= 0:
@@ -57,13 +57,13 @@ class ScreeningMechanism:
         if self.lam <= 0:
             raise ValueError("lam must be > 0")
 
-        # RNG for reproducible simulations
-        self._rng: np.random.RandomState
-        if self.seed is None:
-            # Use global RNG
-            self._rng = np.random.mtrand._rand  # type: ignore[attr-defined]
-        else:
-            self._rng = np.random.RandomState(self.seed)
+        # # RNG for reproducible simulations
+        # self._rng: np.random.RandomState
+        # if self.seed is None:
+        #     # Use global RNG
+        #     self._rng = np.random.mtrand._rand  # type: ignore[attr-defined]
+        # else:
+        #     self._rng = np.random.RandomState(self.seed)
 
     # ------------------------------------------------------------------
     # Cost -> variance map

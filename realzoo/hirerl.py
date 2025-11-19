@@ -571,6 +571,7 @@ class JobMarketEnv(ParallelEnv):
 
         observations = {agent: self._get_obs(agent) for agent in self.agents}
         infos = {agent: self._get_info(agent) for agent in self.agents}
+        truncations = {agent: False for agent in self.agents}
         terminations = {agent: False for agent in self.agents}
 
         if self.timestep >= self.max_timesteps:
