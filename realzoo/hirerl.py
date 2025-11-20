@@ -492,6 +492,7 @@ class JobMarketEnv(ParallelEnv):
         # record firings during this step
         for agent, info in infos.items():
             info["firings"] = []
+            info["hirings"] = []
         return observations, infos
 
     def step(
@@ -539,6 +540,7 @@ class JobMarketEnv(ParallelEnv):
         screening_costs = {agent: 0.0 for agent in self.agents}
         tilde_matrix = np.full((self.num_companies, self.num_workers), -np.inf, dtype=np.float32)
         targeted_workers: set[int] = set()
+        hirings_record = {agent: [] for agent in self.agents}
 
         if self.module_toggles["interview"]:
             for agent in self.agents:
@@ -593,6 +595,9 @@ class JobMarketEnv(ParallelEnv):
                 if wage_offer is None:
                     continue
                 self.worker_pool.hire_worker(worker_id, firm_idx, wage_offer)
+                agent_name = f"company_{firm_idx}"
+                if agent_name in hirings_record:
+                    hirings_record[agent_name].append(worker_id)
 
         total_profits = {agent: 0.0 for agent in self.agents}
         total_wages = {agent: 0.0 for agent in self.agents}
@@ -638,6 +643,7 @@ class JobMarketEnv(ParallelEnv):
             self.worker_pool.update_experience_and_tenure()
 
         firing_costs = {agent: 0.0 for agent in self.agents}
+        firings_record = {agent: [] for agent in self.agents}
 
         if self.module_toggles["firing"]:
             for agent in self.agents:
@@ -660,9 +666,7 @@ class JobMarketEnv(ParallelEnv):
                         firing_costs[agent] += self.base_firing_cost
                         self._last_profit[agent][worker_id] = 0.0
                         self._interview_signal_at_hire[agent][worker_id] = 0.0
-                        if agent not in infos:
-                            infos[agent] = self._get_info(agent)
-                        infos[agent].setdefault("firings", []).append(worker_id)
+                        firings_record[agent].append(worker_id)
 
         rewards = {}
         for agent in self.agents:
@@ -679,6 +683,9 @@ class JobMarketEnv(ParallelEnv):
 
         observations = {agent: self._get_obs(agent) for agent in self.agents}
         infos = {agent: self._get_info(agent) for agent in self.agents}
+        for agent in self.agents:
+            infos[agent]["hirings"] = hirings_record[agent]
+            infos[agent]["firings"] = firings_record[agent]
         terminations = {agent: False for agent in self.agents}
         # we need these all to be true to generate the episodic_return chart
         truncations = {agent: self.timestep >= self.max_timesteps for agent in self.agents}
