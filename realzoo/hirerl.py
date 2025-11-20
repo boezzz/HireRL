@@ -229,7 +229,7 @@ class JobMarketEnv(ParallelEnv):
             Only unemployed workers are considered, sorted by public signal.
         """
         public = self.worker_pool.get_public_state()
-        sigma_hat = public["sigma_hat"][:, 0] if self.ability_dim == 1 else np.mean(public["sigma_hat"], axis=1)
+        sigma_hat = public["sigma_hat"][:, 0] #shape is (10,)
 
         # Compute current firm sizes
         firm_sizes = {
@@ -271,6 +271,8 @@ class JobMarketEnv(ParallelEnv):
         Returns:
             float cost in [action_low, action_high]; if discrete, looks up
             `cost_levels[idx]`.
+
+            no matter is discrete or cns, it returns a scalar (which is correct).
         """
         if self.action_mode == "discrete":
             idx = int(np.clip(int(action), 0, self.action_size - 1))
@@ -456,8 +458,8 @@ class JobMarketEnv(ParallelEnv):
         for agent in self.agents:
             beliefs = FirmBeliefs(num_workers=self.num_workers, ability_dim=self.ability_dim)
             for worker_id in range(self.num_workers):
-                sigma_init = public_state["sigma_hat"][worker_id]
-                init_val = float(sigma_init[0]) if self.ability_dim == 1 else float(np.mean(sigma_init))
+                sigma_hat_init = public_state["sigma_hat"][worker_id]
+                init_val = float(sigma_hat_init[0])
                 beliefs.initialize_from_interview_signal(worker_id, init_val, signal_noise_var=base_var)
             self.firm_beliefs[agent] = beliefs
             self._interview_signal_at_hire[agent] = np.zeros(self.num_workers, dtype=np.float32)
@@ -482,9 +484,9 @@ class JobMarketEnv(ParallelEnv):
                 initial_wage = 0.0
                 self.worker_pool.hire_worker(worker_id, firm_idx, initial_wage)
                 agent_name = f"company_{firm_idx}"
-                sigma_init = public_state["sigma_hat"][worker_id]
-                signal_scalar = float(sigma_init[0]) if self.ability_dim == 1 else float(np.mean(sigma_init))
-                self._interview_signal_at_hire[agent_name][worker_id] = signal_scalar
+                sigma_hat_init = public_state["sigma_hat"][worker_id]
+                sigma_tilde_init = float(sigma_hat_init[0])
+                self._interview_signal_at_hire[agent_name][worker_id] = sigma_tilde_init
                 self._interview_vars[agent_name][worker_id] = base_var
 
         observations = {agent: self._get_obs(agent) for agent in self.agents}
