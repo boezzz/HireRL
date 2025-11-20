@@ -414,16 +414,15 @@ class JobMarketEnv(ParallelEnv):
         metrics = []
         for worker_id in range(self.num_workers):
             sigma_hat = public["sigma_hat"][worker_id]
-            public_ability = float(sigma_hat[0]) if self.ability_dim == 1 else float(np.mean(sigma_hat))
             metrics.append(
                 {
                     "worker_id": worker_id,
                     "public_tenure": float(public["tenure"][worker_id]),
-                    "public_ability": public_ability,
+                    "sigma_hat": float(sigma_hat[0]),
                     "experience": float(self.worker_pool.workers[worker_id].experience),
                     "interview_cost": float(self._current_interview_costs[agent][worker_id]),
                     "profit": float(self._last_profit[agent][worker_id]),
-                    "private_belief": float(self.firm_beliefs[agent].belief_mean[worker_id, 0]),
+                    "sigma_tilde": float(self.firm_beliefs[agent].belief_mean[worker_id, 0]),
                     "wage": float(self.worker_pool.workers[worker_id].wage),
                 }
             )
@@ -462,7 +461,8 @@ class JobMarketEnv(ParallelEnv):
                 init_val = float(sigma_hat_init[0])
                 beliefs.initialize_from_interview_signal(worker_id, init_val, signal_noise_var=base_var)
             self.firm_beliefs[agent] = beliefs
-            self._interview_signal_at_hire[agent] = np.zeros(self.num_workers, dtype=np.float32)
+            sigma_hat_flat = public_state["sigma_hat"].flatten().astype(np.float32)
+            self._interview_signal_at_hire[agent] = sigma_hat_flat.copy()
             self._interview_vars[agent] = np.full(self.num_workers, base_var, dtype=np.float32)
             self._last_profit[agent] = np.zeros(self.num_workers, dtype=np.float32)
             self._current_interview_costs[agent] = np.zeros(self.num_workers, dtype=np.float32)
@@ -484,9 +484,6 @@ class JobMarketEnv(ParallelEnv):
                 initial_wage = 0.0
                 self.worker_pool.hire_worker(worker_id, firm_idx, initial_wage)
                 agent_name = f"company_{firm_idx}"
-                sigma_hat_init = public_state["sigma_hat"][worker_id]
-                sigma_tilde_init = float(sigma_hat_init[0])
-                self._interview_signal_at_hire[agent_name][worker_id] = sigma_tilde_init
                 self._interview_vars[agent_name][worker_id] = base_var
 
         observations = {agent: self._get_obs(agent) for agent in self.agents}
@@ -524,7 +521,7 @@ class JobMarketEnv(ParallelEnv):
             {
                 "experience": worker.experience,
                 "employed": worker.employed_by >= 0,
-                "sigma": float(worker.sigma_true[0] if self.ability_dim == 1 else np.mean(worker.sigma_true)),
+                "sigma": float(worker.sigma_true[0] ,
             }
             for worker in self.worker_pool.workers
         ]
