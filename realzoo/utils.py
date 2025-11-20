@@ -8,8 +8,11 @@ helpers
 
 import csv
 import json
+import os
+from collections import defaultdict
 from typing import Dict, List, Any, Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -36,12 +39,14 @@ class EpisodeLogger:
             'agent',
             'worker_id',
             'public_tenure',
-            'public_ability',
+            'sigma_hat',
             'experience',
             'interview_cost',
             'profit',
-            'private_belief',
+            'sigma_tilde',
+            'sigma_true',
             'wage',
+            'action_value',
         ]
         self.episode_counter = 0
         self.reset()
@@ -77,7 +82,7 @@ class EpisodeLogger:
         self.average_wages.append(infos[first_agent]['avg_wage'])
 
         if self.csv_path:
-            self._log_worker_metrics(timestep, infos)
+            self._log_worker_metrics(timestep, infos, actions)
 
     def get_summary(self) -> Dict[str, Any]:
         """Get summary statistics for episode."""
@@ -130,7 +135,7 @@ class EpisodeLogger:
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=self._csv_headers)
         self._csv_writer.writeheader()
 
-    def _log_worker_metrics(self, timestep: int, infos: Dict[str, dict]):
+    def _log_worker_metrics(self, timestep: int, infos: Dict[str, dict], actions: Dict[str, int]):
         if not self.csv_path:
             return
         self._ensure_csv_writer()
@@ -139,6 +144,14 @@ class EpisodeLogger:
             metrics = infos.get(agent, {}).get('worker_metrics')
             if not metrics:
                 continue
+            action_raw = actions.get(agent)
+            if action_raw is None:
+                action_value = None
+            elif isinstance(action_raw, (list, tuple)):
+                action_value = float(np.asarray(action_raw).reshape(-1)[0])
+            else:
+                arr = np.asarray(action_raw)
+                action_value = float(arr.reshape(-1)[0]) if arr.size else None
             for entry in metrics:
                 rows.append(
                     {
@@ -147,16 +160,68 @@ class EpisodeLogger:
                         'agent': agent,
                         'worker_id': entry['worker_id'],
                         'public_tenure': entry['public_tenure'],
-                        'public_ability': entry['public_ability'],
+                        'sigma_hat': entry['sigma_hat'],
                         'experience': entry['experience'],
                         'interview_cost': entry['interview_cost'],
                         'profit': entry['profit'],
-                        'private_belief': entry['private_belief'],
+                        'sigma_tilde': entry['sigma_tilde'],
+                        'sigma_true': entry['sigma_true'],
                         'wage': entry['wage'],
+                        'action_value': action_value,
                     }
                 )
         if rows and self._csv_writer:
             self._csv_writer.writerows(rows)
+
+    def plot_sigma_and_actions(self, output_dir: str):
+        """
+        Generate sigma and action plots from the CSV log.
+        """
+        if not self.csv_path or not os.path.exists(self.csv_path):
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        sigma_series = defaultdict(lambda: {'t': [], 'sigma_hat': [], 'sigma_tilde': [], 'sigma_true': []})
+        action_series = defaultdict(lambda: {'t': [], 'action': []})
+
+        with open(self.csv_path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                agent = row['agent']
+                timestep = int(row['timestep'])
+                worker_id = int(row['worker_id'])
+                key = (agent, worker_id)
+                sigma_series[key]['t'].append(timestep)
+                sigma_series[key]['sigma_hat'].append(float(row['sigma_hat']))
+                sigma_series[key]['sigma_tilde'].append(float(row['sigma_tilde']))
+                sigma_series[key]['sigma_true'].append(float(row['sigma_true']))
+                if row['action_value'] not in (None, '', 'None'):
+                    action_series[agent]['t'].append(timestep)
+                    action_series[agent]['action'].append(float(row['action_value']))
+
+        for (agent, worker_id), data in sigma_series.items():
+            plt.figure()
+            plt.plot(data['t'], data['sigma_true'], label='sigma_true')
+            plt.plot(data['t'], data['sigma_hat'], label='sigma_hat')
+            plt.plot(data['t'], data['sigma_tilde'], label='sigma_tilde')
+            plt.xlabel('timestep')
+            plt.ylabel('sigma value')
+            plt.title(f'{agent} worker {worker_id}')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{agent}_worker{worker_id}_sigma.png'))
+            plt.close()
+
+        for agent, data in action_series.items():
+            if not data['t']:
+                continue
+            plt.figure()
+            plt.step(data['t'], data['action'], where='post')
+            plt.xlabel('timestep')
+            plt.ylabel('action (interview cost)')
+            plt.title(f'{agent} actions')
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{agent}_actions.png'))
+            plt.close()
 
 
 def compute_market_efficiency(

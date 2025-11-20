@@ -56,6 +56,8 @@ class PolicyEvaluator:
         device: str = 'cpu',
         seed: Optional[int] = None,
         csv_path: Optional[str] = None,
+        plot_metrics: bool = False,
+        plot_output_dir: Optional[str] = None,
     ):
         """
         Initialize policy evaluator.
@@ -71,6 +73,8 @@ class PolicyEvaluator:
         self.device = device
         self.seed = seed if seed is not None else 42
         self.csv_path = csv_path
+        self.plot_metrics = plot_metrics
+        self.plot_output_dir = plot_output_dir
 
         # Create evaluation environment
         self.env = self._create_environment(env_config, self.seed)
@@ -311,6 +315,10 @@ class PolicyEvaluator:
         if verbose:
             self._print_summary(results)
             self._print_worker_summary(results, n_workers=min(5, num_workers))  # Show top 5 workers
+
+        if self.plot_metrics and self.csv_path:
+            output_dir = self.plot_output_dir or os.path.dirname(self.csv_path)
+            logger.plot_sigma_and_actions(output_dir)
 
         logger.close()
         return results
@@ -677,6 +685,8 @@ def main():
                        help='Save plots to output directory')
     parser.add_argument('--step_metrics_csv', type=str, default=None,
                        help='Optional path to save per-step worker metrics CSV')
+    parser.add_argument('--plot_step_metrics', action='store_true',
+                       help='Generate sigma/action plots from per-step CSV')
 
     args = parser.parse_args()
 
@@ -728,12 +738,15 @@ def main():
         )
 
     # Create evaluator
+    plot_dir = os.path.join(args.output_dir, "step_plots")
     evaluator = PolicyEvaluator(
         checkpoint_paths=checkpoints,
         env_config=env_config,
         device='cpu',
         seed=args.seed,
         csv_path=args.step_metrics_csv,
+        plot_metrics=args.plot_step_metrics,
+        plot_output_dir=plot_dir,
     )
 
     # Run evaluation

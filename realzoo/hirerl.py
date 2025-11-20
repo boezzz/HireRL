@@ -423,6 +423,7 @@ class JobMarketEnv(ParallelEnv):
                     "interview_cost": float(self._current_interview_costs[agent][worker_id]),
                     "profit": float(self._last_profit[agent][worker_id]),
                     "sigma_tilde": float(self.firm_beliefs[agent].belief_mean[worker_id, 0]),
+                    "sigma_true": float(self.worker_pool.workers[worker_id].sigma_true[0]),
                     "wage": float(self.worker_pool.workers[worker_id].wage),
                 }
             )
@@ -554,7 +555,7 @@ class JobMarketEnv(ParallelEnv):
                     sigma_hat_0=worker.sigma_hat,
                     cost=cost,
                 )
-                signal_scalar = float(tilde_sigma[0]) if self.ability_dim == 1 else float(np.mean(tilde_sigma))
+                signal_scalar = float(tilde_sigma[0])
                 var_val = self.screening.interview_var(cost)
 
                 self.firm_beliefs[agent].initialize_from_interview_signal(
