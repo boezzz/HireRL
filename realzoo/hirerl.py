@@ -489,6 +489,9 @@ class JobMarketEnv(ParallelEnv):
 
         observations = {agent: self._get_obs(agent) for agent in self.agents}
         infos = {agent: self._get_info(agent) for agent in self.agents}
+        # record firings during this step
+        for agent, info in infos.items():
+            info["firings"] = []
         return observations, infos
 
     def step(
@@ -657,6 +660,9 @@ class JobMarketEnv(ParallelEnv):
                         firing_costs[agent] += self.base_firing_cost
                         self._last_profit[agent][worker_id] = 0.0
                         self._interview_signal_at_hire[agent][worker_id] = 0.0
+                        if agent not in infos:
+                            infos[agent] = self._get_info(agent)
+                        infos[agent].setdefault("firings", []).append(worker_id)
 
         rewards = {}
         for agent in self.agents:
