@@ -192,6 +192,7 @@ class WorkerPool:
         worker = self.workers[worker_id]
         worker.employed_by = -1
         worker.wage = 0.0
+        worker.tenure = max(0, worker.tenure - 2)
         # Update their "resume" signal for next employer (Per PDF: σ̂_j,0^(next) := σ̂_j,t)
         worker.sigma_hat_0 = worker.sigma_hat.copy()
 
