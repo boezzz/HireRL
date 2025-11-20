@@ -521,7 +521,7 @@ class JobMarketEnv(ParallelEnv):
             {
                 "experience": worker.experience,
                 "employed": worker.employed_by >= 0,
-                "sigma": float(worker.sigma_true[0] ,
+                "sigma": float(worker.sigma_true[0])
             }
             for worker in self.worker_pool.workers
         ]
