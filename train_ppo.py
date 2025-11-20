@@ -648,6 +648,7 @@ class IPPOTrainer:
                     log_prob=log_probs[agent_name],
                     done=done
                 )
+                self.writer.add_scalar(f"{agent_name}/reward", rewards[agent_name], self.global_step)
 
             if self.log_step_data:
                 for agent_name in self.env.agents:
@@ -855,7 +856,7 @@ def main():
     env.set_module_toggles(
         wage_adjustment=False,
         interview=True,
-        matching=False,
+        matching=True,
         production=False,
         experience=False,
         firing=False,

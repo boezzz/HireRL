@@ -65,6 +65,17 @@ class JobMarketEnv(ParallelEnv):
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
     ):
+        """
+        Initialize the job-market environment.
+
+        Key tensor shapes:
+            - Worker belief/state arrays live in `(num_workers, ability_dim)` form.
+            - Observations flatten these arrays into a 1-D vector of length
+              `obs_size = num_workers * (ability_dim*3 + 5) + num_workers + 1`
+              (see `_get_obs` for the exact breakdown).
+            - Continuous action space is a Box with shape `(1,)`; discrete mode
+              uses `Discrete(num_interview_cost_levels)`.
+        """
         super().__init__()
 
         self.render_mode = render_mode
@@ -165,13 +176,13 @@ class JobMarketEnv(ParallelEnv):
             self._action_spaces = {agent: Discrete(self.action_size) for agent in self.agents}
 
         obs_size = (
-            num_workers * ability_dim  # sigma_hat
+            num_workers * ability_dim  # sigma_hat public belief.
             + num_workers  # experience
             + num_workers  # tenure
             + num_workers  # employed_by
             + num_workers  # wages
-            + num_workers * ability_dim  # belief mean
-            + num_workers * ability_dim  # belief variance
+            + num_workers * ability_dim  # private belief,
+            + num_workers * ability_dim  # private belief variance.
             + num_workers  # own workforce indicator
             + 1  # own profit
         )
@@ -186,6 +197,8 @@ class JobMarketEnv(ParallelEnv):
                 "action_mask": MultiBinary(self.action_size),
             }
         )
+        print(obs_size)
+
         self._observation_spaces = {agent: obs_space for agent in self.agents}
 
         self.timestep = 0
@@ -196,17 +209,25 @@ class JobMarketEnv(ParallelEnv):
     # Helpers
     # ------------------------------------------------------------------
     def observation_space(self, agent: str):
+        """Return the Dict observation space (`observation` vector + action mask) for `agent`."""
         return self._observation_spaces[agent]
 
     def action_space(self, agent: str):
+        """Return the action space (Box or Discrete) for `agent`."""
         return self._action_spaces[agent]
 
     def _company_index(self, agent: str) -> int:
+        """Extract integer firm index from agent name like 'company_2'."""
         return int(agent.split("_")[1])
 
     def _deterministic_interview_assignments(self) -> Dict[int, int]:
-        """Assign each firm to the highest public-signal unemployed worker.
-        Firms are prioritized by current firm size (descending)."""
+        """
+        Assign each firm to the highest public-signal unemployed worker.
+
+        Returns:
+            Mapping `firm_idx -> worker_id` for firms that receive an interview.
+            Only unemployed workers are considered, sorted by public signal.
+        """
         public = self.worker_pool.get_public_state()
         sigma_hat = public["sigma_hat"][:, 0] if self.ability_dim == 1 else np.mean(public["sigma_hat"], axis=1)
 
@@ -244,6 +265,13 @@ class JobMarketEnv(ParallelEnv):
         return assignments
 
     def _cost_from_action(self, action: Any) -> float:
+        """
+        Map a policy action (index or float) into an interview cost scalar.
+
+        Returns:
+            float cost in [action_low, action_high]; if discrete, looks up
+            `cost_levels[idx]`.
+        """
         if self.action_mode == "discrete":
             idx = int(np.clip(int(action), 0, self.action_size - 1))
             return float(self.cost_levels[idx])
@@ -254,6 +282,15 @@ class JobMarketEnv(ParallelEnv):
         return float(np.clip(value, self.action_low, self.action_high))
 
     def _compute_vx(self, exp_t: float, delta_interview_sq: float) -> float:
+        """
+        Compute the weight `v_x` used in belief/wage updates.
+
+        Args:
+            exp_t: scalar experience at time t.
+            delta_interview_sq: interview noise variance.
+        Returns:
+            Scalar between 0 and 1.
+        """
         exp_t = max(0.0, float(exp_t))
         denom = delta_interview_sq + self.delta_eps_sq
         if denom <= 0.0:
@@ -264,7 +301,12 @@ class JobMarketEnv(ParallelEnv):
         return (exp_t * K1) / (1.0 + (exp_t - 1.0) * K1)
 
     def _update_wages_existing_employees(self):
-        """Apply step (5) wage rule for continuing employees before new hires."""
+        """
+        Apply step (5) wage rule for continuing employees before new hires.
+
+        Iterates over each current worker and updates their wage using the last
+        stored interview signal (`_interview_signal_at_hire`) and profit (`_last_profit`).
+        """
         for agent in self.agents:
             company_idx = self._company_index(agent)
             workforce = self.worker_pool.get_employed_by_company(company_idx)
@@ -287,6 +329,14 @@ class JobMarketEnv(ParallelEnv):
                 worker.wage = result.wage_t
 
     def _generate_action_mask(self, agent: str) -> np.ndarray:
+        """
+        Build the valid-action mask for `agent`.
+
+        Returns:
+            In continuous mode: all ones of shape `(1,)`.
+            In discrete mode: binary vector of length `action_size` where only
+            NO_OP is valid for firms without an assignment.
+        """
         if self.action_mode == "continuous":
             return np.ones(self.action_size, dtype=np.int8)
 
@@ -301,6 +351,19 @@ class JobMarketEnv(ParallelEnv):
         return mask
 
     def _get_obs(self, agent: str) -> Dict[str, np.ndarray]:
+        """
+        Construct observation dictionary for `agent`.
+
+        The flattened observation concatenates:
+            sigma_hat (num_workers * ability_dim),
+            experience (num_workers),
+            tenure (num_workers),
+            employed_by indicators (num_workers),
+            wages (num_workers),
+            belief mean/var (each num_workers * ability_dim),
+            own_workforce indicator (num_workers),
+            recent profit (1).
+        """
         company_idx = self._company_index(agent)
         public = self.worker_pool.get_public_state()
         beliefs = self.firm_beliefs[agent]
@@ -313,15 +376,15 @@ class JobMarketEnv(ParallelEnv):
 
         obs = np.concatenate(
             [
-                public["sigma_hat"].flatten(),
-                public["experience"],
-                public["tenure"].astype(np.float32),
-                public["employed_by"].astype(np.float32),
-                public["wages"],
-                beliefs.belief_mean.flatten(),
-                beliefs.belief_var.flatten(),
-                own_workforce,
-                own_profit,
+                public["sigma_hat"].flatten(),  # (num_workers, ability_dim) -> (num_workers*ability_dim,)
+                public["experience"],  # (num_workers,)
+                public["tenure"].astype(np.float32),  # (num_workers,)
+                public["employed_by"].astype(np.float32),  # (num_workers,)
+                public["wages"],  # (num_workers,)
+                beliefs.belief_mean.flatten(),  # (num_workers, ability_dim) -> (num_workers*ability_dim,)
+                beliefs.belief_var.flatten(),  # (num_workers, ability_dim) -> (num_workers*ability_dim,)
+                own_workforce,  # (num_workers,)
+                own_profit,  # (1,)
             ]
         ).astype(np.float32)
 
@@ -337,6 +400,12 @@ class JobMarketEnv(ParallelEnv):
                 self.module_toggles[key] = bool(value)
 
     def _get_info(self, agent: str) -> Dict[str, Any]:
+        """
+        Collect diagnostic info for `agent`.
+
+        Includes workforce size, aggregate profits, unemployment stats,
+        current timestep, and per-worker metrics (see `worker_metrics` list).
+        """
         company_idx = self._company_index(agent)
         workforce = self.worker_pool.get_employed_by_company(company_idx)
         public = self.worker_pool.get_public_state()
@@ -366,6 +435,12 @@ class JobMarketEnv(ParallelEnv):
         }
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        """
+        Reset environment state and return initial observations/infos.
+
+        Re-samples worker pool, reinitializes beliefs, and assigns each firm
+        a random workforce (up to `max_workers_per_company`).
+        """
         if seed is not None:
             self.rng = np.random.RandomState(seed)
 
@@ -425,6 +500,16 @@ class JobMarketEnv(ParallelEnv):
         Dict[str, bool],
         Dict[str, Dict[str, Any]],
     ]:
+        """
+        Execute one environment timestep.
+
+        Args:
+            actions: dict mapping agent name to either interview cost (float) or
+                     discrete index, depending on action mode.
+        Returns:
+            tuple of (observations, rewards, terminations, truncations, infos),
+            each a dict keyed by agent names.
+        """
         decoded_actions: Dict[str, float] = {}
         for agent in self.agents:
             default = 0 if self.action_mode == "discrete" else 0.0
@@ -588,8 +673,9 @@ class JobMarketEnv(ParallelEnv):
 
         observations = {agent: self._get_obs(agent) for agent in self.agents}
         infos = {agent: self._get_info(agent) for agent in self.agents}
-        truncations = {agent: False for agent in self.agents}
         terminations = {agent: False for agent in self.agents}
+        # we need these all to be true to generate the episodic_return chart
+        truncations = {agent: self.timestep >= self.max_timesteps for agent in self.agents}
 
         if self.timestep >= self.max_timesteps:
             self.agents = []
@@ -597,6 +683,7 @@ class JobMarketEnv(ParallelEnv):
         return observations, rewards, terminations, truncations, infos
 
     def render(self):
+        """Print a textual summary of key metrics when `render_mode='human'`."""
         if self.render_mode != "human":
             return
 
@@ -619,4 +706,5 @@ class JobMarketEnv(ParallelEnv):
         print(f"{'=' * 60}\n")
 
     def close(self):
+        """PettingZoo compatibility method; nothing persistent to clean up."""
         return None
