@@ -56,12 +56,12 @@ def print_worker_metrics(infos: Dict[str, Dict], step: int):
 
 def run_manual_simulation():
     env = JobMarketEnv(
-        num_companies=2,
-        num_workers=5,
+        num_companies=5,
+        num_workers=20,
         ability_dim=1,
-        max_workers_per_company=3,
+        max_workers_per_company=4,
         action_mode="continuous",
-        seed=123,
+       # seed=123,
     )
 
     observations, infos = env.reset()
@@ -70,6 +70,12 @@ def run_manual_simulation():
     csv_rows: List[Dict] = []
     interview_events = defaultdict(lambda: {'t': [], 'value': []})
     firing_events = defaultdict(list)
+    hiring_events = defaultdict(list)
+    hire_counts = defaultdict(list)
+    fire_counts = defaultdict(list)
+    total_hires_per_step: List[int] = []
+    total_fires_per_step: List[int] = []
+    step_indices: List[int] = []
     horizon = 10
     for step in range(1, horizon + 1):
         actions = {}
@@ -84,26 +90,45 @@ def run_manual_simulation():
 
         print(f"\nStep {step} rewards: {rewards}")
         print_worker_metrics(infos, step=step)
-        for agent, info in infos.items():
-            for entry in info.get('worker_metrics', []):
-                csv_rows.append({
-                    'timestep': step,
-                    'agent': agent,
-                    'worker_id': entry['worker_id'],
-                    'sigma_true': entry['sigma_true'],
-                    'sigma_hat': entry['sigma_hat'],
-                    'sigma_tilde': entry['sigma_tilde'],
-                    'wage': entry['wage'],
-                    'action_value': float(actions.get(agent)) if actions.get(agent) is not None else None,
-                    'interview_cost': entry['interview_cost'],
-                })
-                if entry['interview_cost'] > 0:
-                    key = (agent, entry['worker_id'])
-                    interview_events[key]['t'].append(step)
-                    interview_events[key]['value'].append(entry['interview_cost'])
-            for worker_id in info.get("firings", []):
-                firing_events[(agent, worker_id)].append(step)
+        step_total_hires = 0
+        step_total_fires = 0
+        for agent in env.possible_agents:
+            info = infos.get(agent)
+            if info:
+                for entry in info.get('worker_metrics', []):
+                    csv_rows.append({
+                        'timestep': step,
+                        'agent': agent,
+                        'worker_id': entry['worker_id'],
+                        'sigma_true': entry['sigma_true'],
+                        'sigma_hat': entry['sigma_hat'],
+                        'sigma_tilde': entry['sigma_tilde'],
+                        'wage': entry['wage'],
+                        'action_value': float(actions.get(agent)) if actions.get(agent) is not None else None,
+                        'interview_cost': entry['interview_cost'],
+                    })
+                    if entry['interview_cost'] > 0:
+                        key = (agent, entry['worker_id'])
+                        interview_events[key]['t'].append(step)
+                        interview_events[key]['value'].append(entry['interview_cost'])
+                hires = info.get("hirings", [])
+                fires = info.get("firings", [])
+            else:
+                hires = []
+                fires = []
+            hire_counts[agent].append(len(hires))
+            fire_counts[agent].append(len(fires))
+            step_total_hires += len(hires)
+            step_total_fires += len(fires)
+            if info:
+                for worker_id in hires:
+                    hiring_events[(agent, worker_id)].append(step)
+                for worker_id in fires:
+                    firing_events[(agent, worker_id)].append(step)
 
+        total_hires_per_step.append(step_total_hires)
+        total_fires_per_step.append(step_total_fires)
+        step_indices.append(step)
         if all(terminations.values()) or all(truncations.values()):
             print("Episode ended early.")
             break
@@ -149,6 +174,10 @@ def run_manual_simulation():
         if fire_t:
             for t in fire_t:
                 plt.axvline(t, color='red', linestyle=':', alpha=0.4, label='firing')
+        hire_t = hiring_events.get((agent, worker_id), [])
+        if hire_t:
+            for t in hire_t:
+                plt.axvline(t, color='blue', linestyle='-.', alpha=0.4, label='hire')
         handles, labels = plt.gca().get_legend_handles_labels()
         seen = set()
         uniq_handles, uniq_labels = [], []
@@ -160,6 +189,41 @@ def run_manual_simulation():
         plt.legend(uniq_handles, uniq_labels)
         plt.tight_layout()
         plt.savefig(plot_dir / f'{agent}_worker{worker_id}_sigma.png')
+        plt.close()
+
+    if step_indices:
+        union_agents = sorted(set(hire_counts.keys()) | set(fire_counts.keys()))
+        for agent in union_agents:
+            hires = hire_counts.get(agent, [])
+            fires = fire_counts.get(agent, [])
+            if not hires and not fires:
+                continue
+            if not any(hires) and not any(fires):
+                continue
+            series_len = max(len(hires), len(fires))
+            if series_len == 0:
+                continue
+            steps = step_indices[:series_len]
+            plt.figure()
+            plt.step(steps, hires, where='mid', label='hires per step')
+            plt.step(steps, fires, where='mid', label='firings per step')
+            plt.xlabel('timestep')
+            plt.ylabel('count')
+            plt.title(f'{agent} hires/firings per timestep')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(plot_dir / f'{agent}_hire_fire_counts.png')
+            plt.close()
+
+        plt.figure()
+        plt.step(step_indices, total_hires_per_step, where='mid', label='total hires')
+        plt.step(step_indices, total_fires_per_step, where='mid', label='total firings')
+        plt.xlabel('timestep')
+        plt.ylabel('count')
+        plt.title('Aggregate hires/firings per timestep')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_dir / 'aggregate_hire_fire_counts.png')
         plt.close()
 
     for agent, data in action_series.items():
