@@ -56,6 +56,9 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class ActorCritic(nn.Module):
     """
     Actor-Critic network supporting both continuous and discrete actions.
+
+    Network outputs interview costs for ALL workers, then training code
+    extracts the cost for the assigned worker.
     """
 
     def __init__(
@@ -63,12 +66,15 @@ class ActorCritic(nn.Module):
         obs_dim: int,
         action_dim: int,
         action_type: str,
+        num_workers: int,
         action_low: Optional[np.ndarray] = None,
         action_high: Optional[np.ndarray] = None,
         hidden_dim: int = 128,
     ):
         super().__init__()
         self.action_type = action_type
+        self.num_workers = num_workers
+        self.action_dim = action_dim
 
         if self.action_type == "continuous":
             if action_low is None or action_high is None:
@@ -83,11 +89,16 @@ class ActorCritic(nn.Module):
             nn.ReLU(),
         )
 
+        # Actor outputs interview costs for ALL workers
         if self.action_type == "continuous":
-            self.actor_mean = layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
-            self.log_std = nn.Parameter(torch.zeros(action_dim))
+            # Output mean cost for each worker
+            self.actor_mean = layer_init(nn.Linear(hidden_dim, num_workers), std=0.01)
+            self.log_std = nn.Parameter(torch.zeros(num_workers))
         else:
-            self.actor_logits = layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
+            # For discrete mode: output continuous costs, then discretize
+            # This is simpler than separate discrete distributions per worker
+            self.actor_mean = layer_init(nn.Linear(hidden_dim, num_workers), std=0.01)
+            self.log_std = nn.Parameter(torch.zeros(num_workers))
 
         self.critic = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
 
@@ -103,35 +114,39 @@ class ActorCritic(nn.Module):
         obs_tensor: torch.Tensor,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            action: Interview costs for ALL workers, shape (batch, num_workers)
+            raw_action: Unsquashed costs for ALL workers
+            log_prob: Joint log probability over all workers
+            entropy: Total entropy over all workers
+            value: State value
+        """
         features = self.shared(obs_tensor)
         value = self.critic(features).squeeze(-1)
 
-        if self.action_type == "continuous":
-            mean = self.actor_mean(features)
-            log_std = self.log_std.expand_as(mean)
-            std = torch.exp(log_std)
-            dist = Normal(mean, std)
-            raw_action = mean if deterministic else dist.rsample()
-            squashed = self._squash(raw_action)
-            action = self._scale(squashed)
-            log_prob = dist.log_prob(raw_action).sum(dim=-1)
-            correction = torch.log(1 - squashed.pow(2) + 1e-6).sum(dim=-1)
-            log_prob = log_prob - correction
-            entropy = dist.entropy().sum(dim=-1)
-            return action, raw_action, log_prob, entropy, value
+        # Both continuous and discrete use same approach: output costs for all workers
+        mean = self.actor_mean(features)
+        log_std = self.log_std.expand_as(mean)
+        std = torch.exp(log_std)
+        dist = Normal(mean, std)
+        raw_action = mean if deterministic else dist.rsample()
+        squashed = self._squash(raw_action)
+        action = self._scale(squashed)
 
-        logits = self.actor_logits(features)
-        dist = Categorical(logits=logits)
-        if deterministic:
-            action = torch.argmax(logits, dim=-1)
-        else:
-            action = dist.sample()
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        return action, action, log_prob, entropy, value
+        # Joint log prob: sum over all workers
+        log_prob = dist.log_prob(raw_action).sum(dim=-1)
+        correction = torch.log(1 - squashed.pow(2) + 1e-6).sum(dim=-1)
+        log_prob = log_prob - correction
+        entropy = dist.entropy().sum(dim=-1)
+
+        return action, raw_action, log_prob, entropy, value
 
     def get_action(self, obs_dict, deterministic: bool = False):
-        """Utility used by evaluation helpers."""
+        """
+        Utility used by evaluation helpers.
+        Returns interview costs for ALL workers.
+        """
         if isinstance(obs_dict, dict):
             obs = obs_dict['observation']
         else:
@@ -140,34 +155,118 @@ class ActorCritic(nn.Module):
         obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)
         with torch.no_grad():
             action, _, _, _, _ = self.act(obs_tensor, deterministic=deterministic)
-        if self.action_type == "continuous":
-            return action.squeeze(0).cpu().numpy()
-        return int(action.item())
+        # Return full cost vector for all workers
+        return action.squeeze(0).cpu().numpy()
 
     def evaluate_actions(
         self,
         obs: torch.Tensor,
         actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Evaluate actions during training.
+
+        Args:
+            obs: Observations (batch, obs_dim)
+            actions: Raw actions for ALL workers (batch, num_workers)
+
+        Returns:
+            log_probs: Joint log probability over all workers
+            value: State values
+            entropy: Total entropy over all workers
+        """
         features = self.shared(obs)
         value = self.critic(features).squeeze(-1)
 
-        if self.action_type == "continuous":
-            mean = self.actor_mean(features)
-            log_std = self.log_std.expand_as(mean)
-            std = torch.exp(log_std)
-            dist = Normal(mean, std)
-            log_probs = dist.log_prob(actions).sum(dim=-1)
-            squashed = torch.tanh(actions)
-            log_probs = log_probs - torch.log(1 - squashed.pow(2) + 1e-6).sum(dim=-1)
-            entropy = dist.entropy().sum(dim=-1)
-            return log_probs, value, entropy
+        # Treat as continuous actions for all workers
+        mean = self.actor_mean(features)
+        log_std = self.log_std.expand_as(mean)
+        std = torch.exp(log_std)
+        dist = Normal(mean, std)
 
-        logits = self.actor_logits(features)
-        dist = Categorical(logits=logits)
-        log_probs = dist.log_prob(actions.long())
-        entropy = dist.entropy()
+        # Joint log prob over all workers
+        log_probs = dist.log_prob(actions).sum(dim=-1)
+        squashed = torch.tanh(actions)
+        log_probs = log_probs - torch.log(1 - squashed.pow(2) + 1e-6).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
+
         return log_probs, value, entropy
+
+
+def compute_assigned_worker(
+    obs_dict: Dict[str, np.ndarray],
+    num_workers: int,
+    ability_dim: int,
+    company_idx: int,
+    num_companies: int,
+    max_workers_per_company: int
+) -> Optional[int]:
+    """
+    Recompute which worker this firm is assigned to interview.
+
+    Uses the same deterministic logic as the environment:
+    - Firms ordered by size (largest first)
+    - Each firm targets highest public-signal unemployed worker
+    - Workers assigned to firms in priority order
+
+    Args:
+        obs_dict: Observation dictionary containing 'observation' array
+        num_workers: Number of workers
+        ability_dim: Dimension of ability vector
+        company_idx: Index of this firm
+        num_companies: Total number of firms
+        max_workers_per_company: Maximum workforce size
+
+    Returns:
+        worker_id that this firm should interview, or None if no assignment
+    """
+    obs = obs_dict['observation'] if isinstance(obs_dict, dict) else obs_dict
+
+    # Parse observation (must match hirerl.py _get_obs format)
+    # Format: sigma_hat (N*D) + experience (N) + tenure (N) + employed_by (N) +
+    #         wages (N) + belief_mean (N*D) + belief_var (N*D) + own_workforce (N) + profit (1)
+    ptr = 0
+    sigma_hat = obs[ptr:ptr + num_workers * ability_dim].reshape(num_workers, ability_dim)
+    ptr += num_workers * ability_dim
+    experience = obs[ptr:ptr + num_workers]
+    ptr += num_workers
+    tenure = obs[ptr:ptr + num_workers]
+    ptr += num_workers
+    employed_by = obs[ptr:ptr + num_workers]
+    ptr += num_workers
+
+    # Find unemployed workers (employed_by == -1)
+    unemployed = [i for i in range(num_workers) if employed_by[i] == -1]
+    if not unemployed:
+        return None
+
+    # Sort unemployed by public signal (highest first)
+    unemployed_sorted = sorted(unemployed, key=lambda j: float(sigma_hat[j, 0]), reverse=True)
+
+    # Compute firm sizes and priority order
+    firm_sizes = {}
+    for firm_idx in range(num_companies):
+        # Count workers employed by this firm
+        firm_sizes[firm_idx] = int(np.sum(employed_by == firm_idx))
+
+    # Sort firms by size (largest first), break ties by firm index
+    firm_order = sorted(firm_sizes.keys(), key=lambda k: (-firm_sizes[k], k))
+
+    # Assign workers to firms in priority order
+    idx = 0
+    for firm_idx in firm_order:
+        current_workforce = firm_sizes[firm_idx]
+        if current_workforce >= max_workers_per_company:
+            continue
+        if idx >= len(unemployed_sorted):
+            break
+
+        if firm_idx == company_idx:
+            return unemployed_sorted[idx]
+
+        idx += 1
+
+    return None
 
 
 class RolloutBuffer:
@@ -215,6 +314,9 @@ class RolloutBuffer:
 class PPOAgent:
     """
     Proximal Policy Optimization agent supporting both action types.
+
+    Network outputs interview costs for all workers, then extracts the cost
+    for the assigned worker as the environment action.
     """
 
     def __init__(
@@ -222,6 +324,7 @@ class PPOAgent:
         obs_dim: int,
         action_dim: int,
         action_type: str,
+        num_workers: int,
         action_low: Optional[np.ndarray],
         action_high: Optional[np.ndarray],
         lr: float = 3e-4,
@@ -241,11 +344,13 @@ class PPOAgent:
         self.max_grad_norm = max_grad_norm
         self.device = device
         self.action_type = action_type
+        self.num_workers = num_workers
 
         self.network = ActorCritic(
             obs_dim=obs_dim,
             action_dim=action_dim,
             action_type=action_type,
+            num_workers=num_workers,
             action_low=action_low,
             action_high=action_high,
         ).to(device)
@@ -253,7 +358,35 @@ class PPOAgent:
 
         self.buffer = RolloutBuffer()
 
-    def get_action(self, obs_dict, deterministic: bool = False):
+    def get_action(
+        self,
+        obs_dict,
+        company_idx: int,
+        num_companies: int,
+        ability_dim: int,
+        max_workers_per_company: int,
+        deterministic: bool = False
+    ):
+        """
+        Get action for environment.
+
+        Network outputs interview costs for ALL workers, then we extract the
+        cost for the specific worker assigned to this firm.
+
+        Args:
+            obs_dict: Observation dictionary
+            company_idx: Index of this company
+            num_companies: Total number of companies
+            ability_dim: Dimension of ability vector
+            max_workers_per_company: Max workforce size
+            deterministic: Whether to use deterministic policy
+
+        Returns:
+            env_action: Scalar interview cost for assigned worker
+            stored_raw: Full raw action vector (num_workers,) for training
+            value: State value
+            log_prob: Joint log probability over all workers
+        """
         if isinstance(obs_dict, dict):
             obs = obs_dict['observation']
         else:
@@ -262,17 +395,32 @@ class PPOAgent:
         obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
+            # action: (1, num_workers) costs for all workers
             action, raw_action, log_prob, _, value = self.network.act(
                 obs_tensor,
                 deterministic=deterministic,
             )
 
-        if self.action_type == "continuous":
-            env_action = action.squeeze(0).cpu().numpy()
-            stored_raw = raw_action.squeeze(0).cpu().numpy()
+        # Extract costs for all workers
+        all_costs = action.squeeze(0).cpu().numpy()  # (num_workers,)
+        stored_raw = raw_action.squeeze(0).cpu().numpy()  # (num_workers,)
+
+        # Determine which worker is assigned to this firm
+        assigned_worker = compute_assigned_worker(
+            obs_dict=obs_dict,
+            num_workers=self.num_workers,
+            ability_dim=ability_dim,
+            company_idx=company_idx,
+            num_companies=num_companies,
+            max_workers_per_company=max_workers_per_company
+        )
+
+        # Extract cost for assigned worker
+        if assigned_worker is not None:
+            env_action = float(all_costs[assigned_worker])
         else:
-            env_action = int(action.item())
-            stored_raw = int(raw_action.item())
+            # No assignment: return zero cost (no-op)
+            env_action = 0.0
 
         return env_action, stored_raw, value.item(), log_prob.item()
 
@@ -485,6 +633,7 @@ class IPPOTrainer:
                 obs_dim=obs_dim,
                 action_dim=action_dim,
                 action_type=action_type,
+                num_workers=env.num_workers,
                 action_low=action_low,
                 action_high=action_high,
                 lr=lr,
@@ -600,6 +749,17 @@ class IPPOTrainer:
         current_episode_rewards = {agent: 0.0 for agent in self.env.possible_agents}
         episode_length = 0
 
+        # Track interview cost statistics
+        interview_costs = []
+        all_worker_costs = {agent: [] for agent in self.env.possible_agents}  # Track costs for ALL workers
+        assigned_worker_ids = {agent: [] for agent in self.env.possible_agents}
+
+        # Track environment actions (hires, fires)
+        episode_hires = {agent: 0 for agent in self.env.possible_agents}
+        episode_fires = {agent: 0 for agent in self.env.possible_agents}
+        total_hires = 0
+        total_fires = 0
+
         for step in range(n_steps):
             # Get actions from all agents
             actions = {}
@@ -609,22 +769,52 @@ class IPPOTrainer:
 
             for agent_name in self.env.agents:
                 agent = self.agents[agent_name]
+                company_idx = int(agent_name.split('_')[1])
+
                 env_action, raw_action, value, log_prob = agent.get_action(
-                    observations[agent_name]
+                    obs_dict=observations[agent_name],
+                    company_idx=company_idx,
+                    num_companies=self.env.num_companies,
+                    ability_dim=self.env.ability_dim,
+                    max_workers_per_company=self.env.max_workers_per_company,
+                    deterministic=False
                 )
-                if agent.action_type == "continuous":
-                    action_value = float(np.asarray(env_action).reshape(-1)[0])
-                    stored_raw = np.asarray(raw_action)
-                else:
-                    action_value = int(env_action)
-                    stored_raw = int(raw_action)
-                actions[agent_name] = action_value
+
+                # Recompute assigned worker for logging
+                assigned_worker = compute_assigned_worker(
+                    obs_dict=observations[agent_name],
+                    num_workers=self.env.num_workers,
+                    ability_dim=self.env.ability_dim,
+                    company_idx=company_idx,
+                    num_companies=self.env.num_companies,
+                    max_workers_per_company=self.env.max_workers_per_company
+                )
+
+                # env_action is scalar cost for assigned worker
+                # raw_action is (num_workers,) vector of all costs
+                actions[agent_name] = env_action
                 values[agent_name] = value
                 log_probs[agent_name] = log_prob
-                raw_actions[agent_name] = stored_raw
+                raw_actions[agent_name] = raw_action  # Store full vector
+                interview_costs.append(env_action)
+
+                # Track full action distribution
+                all_worker_costs[agent_name].append(raw_action)  # (num_workers,) per step
+                if assigned_worker is not None:
+                    assigned_worker_ids[agent_name].append(assigned_worker)
 
             # Step environment
             next_observations, rewards, terminations, truncations, infos = self.env.step(actions)
+
+            # Track hires and fires from this step
+            for agent_name in self.env.agents:
+                if agent_name in infos:
+                    num_hires = len(infos[agent_name].get('hirings', []))
+                    num_fires = len(infos[agent_name].get('firings', []))
+                    episode_hires[agent_name] += num_hires
+                    episode_fires[agent_name] += num_fires
+                    total_hires += num_hires
+                    total_fires += num_fires
 
             # Accumulate episode rewards
             for agent_name in self.env.possible_agents:
@@ -665,19 +855,120 @@ class IPPOTrainer:
 
             # Check if episode ended
             if all(terminations.values()) or all(truncations.values()):
-                # Log episodic returns
+                # Log episodic returns per agent
+                total_episodic_return = 0.0
                 for agent_name in self.env.possible_agents:
+                    agent_return = current_episode_rewards[agent_name]
                     self.writer.add_scalar(
                         f"charts/{agent_name}_episodic_return",
-                        current_episode_rewards[agent_name],
+                        agent_return,
                         self.global_step
                     )
+                    total_episodic_return += agent_return
+
+                # Log aggregate episodic return
+                self.writer.add_scalar("charts/total_episodic_return", total_episodic_return, self.global_step)
+                self.writer.add_scalar("charts/avg_episodic_return", total_episodic_return / len(self.env.possible_agents), self.global_step)
                 self.writer.add_scalar("charts/episode_length", episode_length, self.global_step)
+
+                # Log hiring/firing actions
+                self.writer.add_scalar("actions/total_hires", total_hires, self.global_step)
+                self.writer.add_scalar("actions/total_fires", total_fires, self.global_step)
+                self.writer.add_scalar("actions/net_employment_change", total_hires - total_fires, self.global_step)
+
+                # Per-agent hiring/firing
+                for agent_name in self.env.possible_agents:
+                    self.writer.add_scalar(
+                        f"actions/{agent_name}/hires",
+                        episode_hires[agent_name],
+                        self.global_step
+                    )
+                    self.writer.add_scalar(
+                        f"actions/{agent_name}/fires",
+                        episode_fires[agent_name],
+                        self.global_step
+                    )
+                    # Hiring rate (hires per episode step)
+                    if episode_length > 0:
+                        self.writer.add_scalar(
+                            f"actions/{agent_name}/hiring_rate",
+                            episode_hires[agent_name] / episode_length,
+                            self.global_step
+                        )
+                        self.writer.add_scalar(
+                            f"actions/{agent_name}/firing_rate",
+                            episode_fires[agent_name] / episode_length,
+                            self.global_step
+                        )
+
+                # Log interview cost statistics
+                if interview_costs:
+                    self.writer.add_scalar("interview/avg_cost", np.mean(interview_costs), self.global_step)
+                    self.writer.add_scalar("interview/max_cost", np.max(interview_costs), self.global_step)
+                    self.writer.add_scalar("interview/min_cost", np.min(interview_costs), self.global_step)
+                    self.writer.add_scalar("interview/std_cost", np.std(interview_costs), self.global_step)
+
+                    # Histogram of interview costs
+                    self.writer.add_histogram("interview/cost_distribution", np.array(interview_costs), self.global_step)
+
+                # Log detailed action distributions per agent
+                for agent_name in self.env.possible_agents:
+                    if all_worker_costs[agent_name]:
+                        # Stack all cost vectors: (num_steps, num_workers)
+                        costs_array = np.array(all_worker_costs[agent_name])
+
+                        # Overall statistics across all workers
+                        self.writer.add_scalar(
+                            f"actions/{agent_name}/mean_cost_all_workers",
+                            costs_array.mean(),
+                            self.global_step
+                        )
+                        self.writer.add_scalar(
+                            f"actions/{agent_name}/std_cost_all_workers",
+                            costs_array.std(),
+                            self.global_step
+                        )
+
+                        # Histogram of ALL predicted costs (for all workers)
+                        self.writer.add_histogram(
+                            f"actions/{agent_name}/all_worker_costs",
+                            costs_array.flatten(),
+                            self.global_step
+                        )
+
+                        # Per-worker cost statistics (average across episode)
+                        per_worker_mean = costs_array.mean(axis=0)  # (num_workers,)
+                        for worker_id in range(self.env.num_workers):
+                            self.writer.add_scalar(
+                                f"actions/{agent_name}/worker_{worker_id}_mean_cost",
+                                per_worker_mean[worker_id],
+                                self.global_step
+                            )
+
+                    # Log which workers were assigned most frequently
+                    if assigned_worker_ids[agent_name]:
+                        worker_counts = np.bincount(
+                            assigned_worker_ids[agent_name],
+                            minlength=self.env.num_workers
+                        )
+                        for worker_id in range(self.env.num_workers):
+                            self.writer.add_scalar(
+                                f"assignments/{agent_name}/worker_{worker_id}_frequency",
+                                worker_counts[worker_id],
+                                self.global_step
+                            )
 
                 # Reset environment and episode tracking
                 observations, _ = self.env.reset()
                 current_episode_rewards = {agent: 0.0 for agent in self.env.possible_agents}
                 episode_length = 0
+                interview_costs = []
+                all_worker_costs = {agent: [] for agent in self.env.possible_agents}
+                assigned_worker_ids = {agent: [] for agent in self.env.possible_agents}
+                episode_hires = {agent: 0 for agent in self.env.possible_agents}
+                episode_fires = {agent: 0 for agent in self.env.possible_agents}
+                total_hires = 0
+                total_fires = 0
 
         self._flush_step_log_buffer()
         return observations
@@ -745,6 +1036,12 @@ class IPPOTrainer:
                 self.writer.add_scalar(f"{agent_name}/approx_kl", stats['approx_kl'], current_timesteps)
                 self.writer.add_scalar(f"{agent_name}/explained_variance", stats['explained_variance'], current_timesteps)
 
+            # Log aggregate statistics across all agents
+            avg_entropy = np.mean([s['entropy'] for s in update_stats.values()])
+            avg_explained_var = np.mean([s['explained_variance'] for s in update_stats.values()])
+            self.writer.add_scalar("charts/avg_entropy", avg_entropy, current_timesteps)
+            self.writer.add_scalar("charts/avg_explained_variance", avg_explained_var, current_timesteps)
+
             # Log learning rate
             if self.anneal_lr:
                 self.writer.add_scalar("charts/learning_rate", lr_now, current_timesteps)
@@ -783,7 +1080,7 @@ class IPPOTrainer:
         self.writer.close()
 
     def evaluate(self, n_episodes: int = 10, deterministic: bool = True):
-        """Evaluate learned policies with action masking."""
+        """Evaluate learned policies."""
         # Set all networks to eval mode
         for agent in self.agents.values():
             agent.network.eval()
@@ -803,11 +1100,28 @@ class IPPOTrainer:
                 # Get actions (deterministic for evaluation)
                 actions = {}
                 for agent_name in self.env.agents:
-                    action = self.agents[agent_name].network.get_action(
+                    company_idx = int(agent_name.split('_')[1])
+
+                    # Get full cost vector from network
+                    all_costs = self.agents[agent_name].network.get_action(
                         observations[agent_name],
                         deterministic=deterministic
                     )
-                    actions[agent_name] = action
+
+                    # Extract cost for assigned worker
+                    assigned_worker = compute_assigned_worker(
+                        obs_dict=observations[agent_name],
+                        num_workers=self.env.num_workers,
+                        ability_dim=self.env.ability_dim,
+                        company_idx=company_idx,
+                        num_companies=self.env.num_companies,
+                        max_workers_per_company=self.env.max_workers_per_company
+                    )
+
+                    if assigned_worker is not None:
+                        actions[agent_name] = float(all_costs[assigned_worker])
+                    else:
+                        actions[agent_name] = 0.0
 
                 # Step
                 observations, rewards, terminations, truncations, infos = self.env.step(actions)
@@ -844,22 +1158,23 @@ def main():
     # Ensure deterministic behavior before anything else
     set_global_seed(seed)
 
-    # Create environment
+    # Create multi-agent environment with multiple companies competing
     env = JobMarketEnv(
-        num_companies=1,
+        num_companies=2,  # Multiple competing firms
         num_workers=10,
-        max_workers_per_company=5,
-        max_timesteps=1000,
+        max_workers_per_company=10,
+        max_timesteps=100,  # Shorter episodes for faster learning
         seed=seed
     )
 
+    # Enable full dynamics: hiring, firing, production, experience
     env.set_module_toggles(
-        wage_adjustment=False,
+        wage_adjustment=True,
         interview=True,
         matching=True,
-        production=False,
-        experience=False,
-        firing=False,
+        production=True,  # Generate profits
+        experience=True,  # Workers accumulate experience
+        firing=True,  # Allow firing decisions
     )
 
     # Create trainer with unique run name
@@ -883,16 +1198,16 @@ def main():
 
     # Train
     trainer.train(
-        total_timesteps=1_00,
-        n_steps=20,
-        n_epochs=100,
-        batch_size=20,
-        log_interval=5,
-        save_interval=5
+        total_timesteps=100_000,  # More timesteps for meaningful learning
+        n_steps=1024,  # Standard PPO rollout length
+        n_epochs=10,  # PPO update epochs
+        batch_size=64,  # Batch size for updates
+        log_interval=10,
+        save_interval=50000
     )
 
     # Evaluate
-    trainer.evaluate(n_episodes=1000, deterministic=True)
+    trainer.evaluate(n_episodes=10, deterministic=True)
 
 
 if __name__ == '__main__':
