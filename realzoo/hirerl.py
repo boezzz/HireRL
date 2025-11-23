@@ -47,6 +47,7 @@ class JobMarketEnv(ParallelEnv):
         num_workers: int = 10,
         ability_dim: int = 1,
         max_workers_per_company: int = 5,
+        firm_capacities: Optional[List[int]] = None,
         gamma: float = 0.1,
         g0: float = 0.1,
         g1: float = 0.05,
@@ -83,6 +84,14 @@ class JobMarketEnv(ParallelEnv):
         self.num_workers = num_workers
         self.ability_dim = ability_dim
         self.max_workers_per_company = max_workers_per_company
+        if firm_capacities is not None:
+            if len(firm_capacities) != num_companies:
+                raise ValueError("firm_capacities length must equal num_companies")
+            if min(firm_capacities) <= 0:
+                raise ValueError("firm_capacities must all be positive")
+            self.firm_capacities = [int(x) for x in firm_capacities]
+        else:
+            self.firm_capacities = None
 
         self.gamma = gamma
         self.g0 = g0
@@ -199,6 +208,14 @@ class JobMarketEnv(ParallelEnv):
         )
         print(obs_size)
 
+    def _capacity(self, firm_idx: int) -> int:
+        """
+        Per-firm hiring capacity. Falls back to a global max when no list is provided.
+        """
+        if self.firm_capacities is None:
+            return self.max_workers_per_company
+        return self.firm_capacities[firm_idx]
+
         self._observation_spaces = {agent: obs_space for agent in self.agents}
 
         self.timestep = 0
@@ -255,7 +272,7 @@ class JobMarketEnv(ParallelEnv):
 
         for firm_idx in firm_order:
             current_workforce = firm_sizes[firm_idx]
-            if current_workforce >= self.max_workers_per_company:
+            if current_workforce >= self._capacity(firm_idx):
                 continue
             if idx >= len(unemployed_sorted):
                 break
@@ -475,7 +492,7 @@ class JobMarketEnv(ParallelEnv):
         for firm_idx in range(self.num_companies):
             if ptr >= len(all_workers):
                 break
-            max_assignable = min(self.max_workers_per_company, len(all_workers) - ptr)
+            max_assignable = min(self._capacity(firm_idx), len(all_workers) - ptr)
             init_n = self.rng.randint(0, max_assignable + 1)
             for _ in range(init_n):
                 if ptr >= len(all_workers):
@@ -586,7 +603,7 @@ class JobMarketEnv(ParallelEnv):
                 if worker_id is None:
                     continue
                 current_workforce = len(self.worker_pool.get_employed_by_company(firm_idx))
-                if current_workforce >= self.max_workers_per_company:
+                if current_workforce >= self._capacity(firm_idx):
                     continue
                 worker = self.worker_pool.workers[worker_id]
                 if worker.employed_by != -1:
@@ -712,7 +729,7 @@ class JobMarketEnv(ParallelEnv):
             recent_profit = self.company_profits[agent][-1] if self.company_profits[agent] else 0.0
             total_profit = float(sum(self.company_profits[agent]))
             print(f"\n{agent}:")
-            print(f"  Workforce: {len(workforce)}/{self.max_workers_per_company}")
+            print(f"  Workforce: {len(workforce)}/{self._capacity(company_idx)}")
             print(f"  Recent Profit: {recent_profit:.2f}")
             print(f"  Total Profit: {total_profit:.2f}")
 
