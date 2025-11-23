@@ -2,6 +2,9 @@
 
 """
 Post-hiring wage adjustment and firing decision rules.
+This file is intentionally phi-free. Any firm-type wage multipliers
+        (phi_type) are applied in the environment layer (JobMarketEnv) after
+        this base wage is computed, to avoid double-counting.
 
 Step 5 (Wage adjustment):
     w_{j,t}
@@ -110,6 +113,11 @@ def adjust_wage_post_hire(
     WageAdjustmentResult
         Contains the new wage, the v_x used, and the signal/profit
         components of the wage rule.
+
+    Note:
+        This function is intentionally phi-free. Any firm-type wage multipliers
+        (phi_type) are applied in the environment layer (JobMarketEnv) after
+        this base wage is computed, to avoid double-counting.
     """
     tilde_sigma_interview = float(tilde_sigma_interview)
     p_ij_tm1 = float(p_ij_tm1)

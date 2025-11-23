@@ -20,6 +20,7 @@ def greedy_wage_matching_from_signals(
     v_x: float,
     g: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     eligible_workers: Optional[List[int]] = None,
+    firm_multipliers: Optional[List[float]] = None,
 ) -> WageMatchingResult:
     """
     3. Firms give the offer to the highest ability worker based on the
@@ -63,9 +64,15 @@ def greedy_wage_matching_from_signals(
             alpha = 0.5
             return 0.5 * (1.0 + np.tanh(alpha * x))
 
-    # 计算工资矩阵 w_{ij} = (1 - v_x) * g(tilde_sigma_{ij})
+    # 计算工资矩阵 w_{ij} = (1 - v_x) * g(tilde_sigma_{ij}) * phi_i
     g_tilde = g(tilde_sigma)
     wages_ij = (1.0 - float(v_x)) * g_tilde
+
+    if firm_multipliers is not None:
+        if len(firm_multipliers) != num_firms:
+            raise ValueError("firm_multipliers length must equal num_firms")
+        multipliers = np.asarray(firm_multipliers, dtype=float).reshape(-1, 1)
+        wages_ij = wages_ij * multipliers
 
     firm_to_worker: Dict[int, Optional[int]] = {i: None for i in range(num_firms)}
     worker_to_firm: Dict[int, Optional[int]] = {j: None for j in range(num_workers)}

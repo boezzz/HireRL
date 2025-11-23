@@ -62,6 +62,8 @@ class JobMarketEnv(ParallelEnv):
         wage_profit_share: float = 0.5,
         initial_offer_vx: float = 0.0,
         max_timesteps: int = 100,
+        firm_types: Optional[List[str]] = None,
+        firm_type_premia: Optional[Dict[str, float]] = None,
         module_toggles: Optional[Dict[str, bool]] = None,
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
@@ -111,6 +113,19 @@ class JobMarketEnv(ParallelEnv):
         self.delta_eps_sq = profit_noise_var
         self.profit_function_type = profit_function_type
         self.max_timesteps = max_timesteps
+
+        # Firm type tags (for wage premia) and premia map
+        if firm_types is not None:
+            if len(firm_types) != num_companies:
+                raise ValueError("firm_types length must equal num_companies")
+            self.firm_types = list(firm_types)
+        else:
+            self.firm_types = ["generic"] * num_companies
+
+        default_premia = {"small": 1.0, "medium": 1.0, "large": 1.0, "generic": 1.0}
+        if firm_type_premia:
+            default_premia.update(firm_type_premia)
+        self.firm_type_premia = default_premia
 
         self.worker_pool = WorkerPool(
             num_workers=num_workers,
@@ -206,7 +221,7 @@ class JobMarketEnv(ParallelEnv):
                 "action_mask": MultiBinary(self.action_size),
             }
         )
-        print(obs_size)
+        self.obs_size = obs_size
 
     def _capacity(self, firm_idx: int) -> int:
         """
@@ -215,6 +230,13 @@ class JobMarketEnv(ParallelEnv):
         if self.firm_capacities is None:
             return self.max_workers_per_company
         return self.firm_capacities[firm_idx]
+
+    def _wage_multiplier(self, firm_idx: int) -> float:
+        """Return phi_type wage multiplier for this firm."""
+        if firm_idx < len(self.firm_types):
+            t = self.firm_types[firm_idx]
+            return float(self.firm_type_premia.get(t, 1.0))
+        return 1.0
 
         self._observation_spaces = {agent: obs_space for agent in self.agents}
 
@@ -345,7 +367,8 @@ class JobMarketEnv(ParallelEnv):
                     psi=self.wage_profit_share,
                 )
 
-                worker.wage = result.wage_t
+                phi = self._wage_multiplier(company_idx)
+                worker.wage = result.wage_t * phi
 
     def _generate_action_mask(self, agent: str) -> np.ndarray:
         """
@@ -592,11 +615,13 @@ class JobMarketEnv(ParallelEnv):
                 targeted_workers.add(worker_id)
 
         if targeted_workers and self.module_toggles["matching"]:
+            phi_list = [self._wage_multiplier(idx) for idx in range(self.num_companies)]
             matching_result = greedy_wage_matching_from_signals(
                 tilde_sigma=tilde_matrix,
                 v_x=self.initial_offer_vx,
                 g=default_g_bounded,
                 eligible_workers=sorted(targeted_workers),
+                firm_multipliers=phi_list,
             )
 
             for firm_idx, worker_id in matching_result.firm_to_worker.items():
