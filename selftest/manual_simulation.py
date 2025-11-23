@@ -9,17 +9,26 @@ import csv
 import os
 import sys
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'realzoo'))
+# Add repo root so we can import both realzoo and real_data_init
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(ROOT, "realzoo"))
+sys.path.insert(0, ROOT)  # allow `import real_data_init.sde`
 
 import numpy as np
 from hirerl import JobMarketEnv
+from real_data_init.sde import (
+    firms_type_config,
+    initialize_firms,
+    to_env_capacities,
+    estimate_size_wage_premia,
+)
 
 
 def choose_manual_action(action_space, action_mask, max_cost: float) -> float:
@@ -54,18 +63,38 @@ def print_worker_metrics(infos: Dict[str, Dict], step: int):
             )
 
 
-def run_manual_simulation():
+def load_realistic_env(num_firms: int = 5,
+                       employees_per_agent: float = 1_000.0,
+                       random_state: int | None = None) -> Tuple[JobMarketEnv, List[str]]:
+    """Build an env seeded by real firm sizes and wage premia."""
+    firms_df = initialize_firms(num_firms=num_firms,
+                                type_config=firms_type_config,
+                                random_state=random_state)
+    capacities = to_env_capacities(firms_df, employees_per_agent=employees_per_agent)
+    firm_types = firms_df["firm_type"].tolist()
+    premia = estimate_size_wage_premia()
+
+    num_workers = sum(capacities)
     env = JobMarketEnv(
-        num_companies=5,
-        num_workers=20,
+        num_companies=len(capacities),
+        num_workers=num_workers,
+        firm_capacities=capacities,
+        firm_types=firm_types,
+        firm_type_premia=premia,
         ability_dim=1,
-        max_workers_per_company=4,
         action_mode="continuous",
-       # seed=123,
+        max_interview_cost=2.0,
+        profit_noise_var=0.4,
     )
+    return env, firm_types
+
+
+def run_manual_simulation():
+    env, firm_types = load_realistic_env(num_firms=5, employees_per_agent=1_000.0, random_state=None)
 
     observations, infos = env.reset()
     print_worker_metrics(infos, step=0)
+    print(f"Firm types: {firm_types}")
 
     csv_rows: List[Dict] = []
     interview_events = defaultdict(lambda: {'t': [], 'value': []})

@@ -127,6 +127,8 @@ class JobMarketEnv(ParallelEnv):
             default_premia.update(firm_type_premia)
         self.firm_type_premia = default_premia
 
+        self.rng = np.random.RandomState(seed)
+
         self.worker_pool = WorkerPool(
             num_workers=num_workers,
             ability_dim=ability_dim,
