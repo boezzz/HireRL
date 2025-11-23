@@ -83,6 +83,111 @@ def wage_variance_ratio(df: pd.DataFrame,
         return None
     return float(v_high / v_low)
 
+
+def wage_mean_by_bin(df: pd.DataFrame,
+                     exp_col: str = "year of experience",
+                     wage_col: str = "salary",
+                     max_bin: int | None = None) -> pd.DataFrame:
+    """
+    Bin wages by floor(experience) and return count/mean per bin.
+    This is similar to wage_variance_by_bin but keeps only count/mean.
+    """
+    work = df.copy()
+    work["exp_bin"] = work[exp_col].apply(lambda x: int(np.floor(x)))
+    if max_bin is not None:
+        work = work[work["exp_bin"] <= max_bin]
+    stats = work.groupby("exp_bin")[wage_col].agg(["count", "mean"]).reset_index()
+    return stats
+
+
+def load_wage_exp_with_size(excel_path: str = None,
+                            exp_col: str = "year of experience",
+                            wage_col: str = "salary",
+                            emp_col: str = "employee_count") -> pd.DataFrame:
+    """
+    Load wage/experience data together with firm size, and attach firm_type
+    (small / medium / large) using the globally computed q50 / q90 thresholds.
+
+    注意：这依赖于模块顶部已经读取的 EXCEL_PATH、EMP_COL、q50、q90。
+    """
+    path = excel_path or EXCEL_PATH
+    usecols = [exp_col, wage_col, emp_col]
+    df = pd.read_excel(path, usecols=usecols)
+    df[exp_col] = df[exp_col].apply(_extract_number)
+    df[wage_col] = df[wage_col].apply(_extract_number)
+    df[emp_col] = df[emp_col].apply(_extract_number)
+    df = df.dropna(subset=[exp_col, wage_col, emp_col])
+    df = df[df[exp_col] >= 0]
+    df = df[df[emp_col] > 0]
+
+    # 使用与公司规模初始化相同的 q50 / q90 阈值划分 firm_type
+    def _firm_type_from_emp(emp: float) -> str:
+        if emp <= q50:
+            return "small"
+        elif emp < q90:
+            return "medium"
+        else:
+            return "large"
+
+    df["firm_type"] = df[emp_col].apply(_firm_type_from_emp)
+    return df
+
+
+def estimate_size_wage_premia(excel_path: str = None,
+                              exp_col: str = "year of experience",
+                              wage_col: str = "salary",
+                              emp_col: str = "employee_count",
+                              max_bin: int | None = None) -> dict:
+    """
+    Estimate simple firm-size-specific wage premia phi_type, such that
+
+        phi_type * pooled_mean_wage(exp_bin)  ≈  type_mean_wage(exp_bin)
+
+    in a least-squares / weighted-average sense over experience bins.
+
+    Returns:
+        {"small": phi_small, "medium": phi_medium, "large": phi_large}
+    """
+    df = load_wage_exp_with_size(excel_path=excel_path,
+                                 exp_col=exp_col,
+                                 wage_col=wage_col,
+                                 emp_col=emp_col)
+
+    # 全市场 pooled 的工资-经验均值曲线
+    pooled_stats = wage_mean_by_bin(df, exp_col=exp_col, wage_col=wage_col, max_bin=max_bin)
+    pooled_stats = pooled_stats.rename(columns={"mean": "mean_pooled", "count": "count_pooled"})
+
+    # 各 firm_type 内的工资-经验均值曲线
+    work = df.copy()
+    work["exp_bin"] = work[exp_col].apply(lambda x: int(np.floor(x)))
+    if max_bin is not None:
+        work = work[work["exp_bin"] <= max_bin]
+    type_stats = (
+        work.groupby(["firm_type", "exp_bin"])[wage_col]
+        .agg(["count", "mean"])
+        .reset_index()
+        .rename(columns={"count": "count_type", "mean": "mean_type"})
+    )
+
+    premia: dict[str, float] = {}
+    for t in ["small", "medium", "large"]:
+        sub = type_stats[type_stats["firm_type"] == t]
+        if sub.empty:
+            continue
+        # 和 pooled 进行 merge，只在两边都有数据的 exp_bin 上拟合
+        merged = sub.merge(pooled_stats, on="exp_bin", how="inner")
+        merged = merged[(merged["mean_pooled"] > 0) & (merged["mean_type"] > 0)]
+        if merged.empty:
+            continue
+
+        # 计算每个经验桶的 ratio = mean_type / mean_pooled，权重取该类型在该桶的样本数
+        ratio = merged["mean_type"] / merged["mean_pooled"]
+        weights = merged["count_type"]
+        phi = float(np.average(ratio, weights=weights))
+        premia[t] = phi
+
+    return premia
+
 # --------------------------------------------------------
 # 1. 读取 Excel 并提取 employee_count 列
 # --------------------------------------------------------
@@ -402,5 +507,14 @@ if __name__ == "__main__":
             print("目标轨迹:", {t: round(target_path[t], 3) for t in target_path})
             print("模型轨迹:", {t: round(ratios[t], 3) for t in ratios})
             print(f"Var history: {vh}")
+
+        # --- Firm-size-specific wage premia (phi_type) ---
+        try:
+            premia = estimate_size_wage_premia()
+            print("\n=== 按公司规模估计的工资系数 phi_type ===")
+            for t, phi in premia.items():
+                print(f"{t}: phi_{t} ≈ {phi:.3f}")
+        except Exception as e:
+            print(f"估计公司规模工资系数时出错: {e}")
     except FileNotFoundError:
         print("找不到工资数据文件，跳过工资方差/信号校准示例。")
