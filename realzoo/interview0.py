@@ -47,7 +47,7 @@ class ScreeningMechanism:
         Optional RNG seed for reproducibility.
     """
 
-    def __init__(self, delta0_sq: float = 1.0, lam: float = 1.0, seed: Optional[int] = None):
+    def __init__(self, delta0_sq: float = 0.4, lam: float = 1.0, seed: Optional[int] = None):
         if delta0_sq <= 0:
             raise ValueError("delta0_sq must be > 0")
         if lam <= 0:

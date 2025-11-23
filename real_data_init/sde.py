@@ -10,6 +10,78 @@
 
 import pandas as pd
 import numpy as np
+import re
+
+# --------------------------------------------------------
+# 数据清洗 & 经验方差目标提取
+# --------------------------------------------------------
+
+
+def _extract_number(val):
+    """Take a messy string like 'US$302,000' or '6 yrs' and return float."""
+    if pd.isna(val):
+        return np.nan
+    s = str(val)
+    s = s.replace(",", "")
+    match = re.findall(r"[0-9]+(?:\\.[0-9]+)?", s)
+    if not match:
+        return np.nan
+    try:
+        return float(match[0])
+    except ValueError:
+        return np.nan
+
+
+def load_wage_exp(excel_path: str = None,
+                  exp_col: str = "year of experience",
+                  wage_col: str = "salary") -> pd.DataFrame:
+    """
+    Load and clean wage/experience data from Excel for variance calibration.
+    """
+    path = excel_path or EXCEL_PATH
+    df = pd.read_excel(path, usecols=[exp_col, wage_col])
+    df[exp_col] = df[exp_col].apply(_extract_number)
+    df[wage_col] = df[wage_col].apply(_extract_number)
+    df = df.dropna(subset=[exp_col, wage_col])
+    df = df[df[exp_col] >= 0]
+    return df
+
+
+def wage_variance_by_bin(df: pd.DataFrame,
+                         exp_col: str = "year of experience",
+                         wage_col: str = "salary",
+                         max_bin: int | None = None) -> pd.DataFrame:
+    """
+    Bin wages by floor(experience) and return count/mean/variance per bin.
+    """
+    work = df.copy()
+    work["exp_bin"] = work[exp_col].apply(lambda x: int(np.floor(x)))
+    if max_bin is not None:
+        work = work[work["exp_bin"] <= max_bin]
+    stats = work.groupby("exp_bin")[wage_col].agg(["count", "mean", "var"]).reset_index()
+    return stats
+
+
+def wage_variance_ratio(df: pd.DataFrame,
+                        exp_col: str = "year of experience",
+                        wage_col: str = "salary",
+                        bin_low: tuple = (0, 1),
+                        bin_high: tuple = (3, 4),
+                        max_bin: int | None = None) -> float | None:
+    """
+    Compute Var(wage | exp in bin_high) / Var(wage | exp in bin_low).
+
+    Returns None if bins are missing or have zero variance.
+    """
+    stats = wage_variance_by_bin(df, exp_col=exp_col, wage_col=wage_col, max_bin=max_bin)
+    bins = stats.set_index("exp_bin")
+    if bin_low[0] not in bins.index or bin_high[0] not in bins.index:
+        return None
+    v_low = bins.loc[bin_low[0], "var"]
+    v_high = bins.loc[bin_high[0], "var"]
+    if pd.isna(v_low) or v_low <= 0:
+        return None
+    return float(v_high / v_low)
 
 # --------------------------------------------------------
 # 1. 读取 Excel 并提取 employee_count 列
@@ -186,6 +258,109 @@ def to_env_capacities(firms_df: pd.DataFrame,
 
 
 # --------------------------------------------------------
+# 7. 小仿真：校准信号/利润噪声，使后验方差下降速度贴近工资方差
+# --------------------------------------------------------
+
+def simulate_posterior_variances(delta_interview_sq: float,
+                                 delta_eps_sq: float,
+                                 g0: float = 0.1,
+                                 g1: float = 0.05,
+                                 theta: float = 0.05,
+                                 periods: int = 4,
+                                 n_workers: int = 10_000,
+                                 seed: int | None = 0) -> list[float]:
+    """
+    Run a lightweight Monte Carlo that mirrors the paper's belief update.
+
+    Returns a list of Var(tilde_sigma_t) for t=0..periods.
+    """
+    rng = np.random.default_rng(seed)
+    sigma_true = rng.normal(0.0, 1.0, size=n_workers)
+
+    # Interview signal
+    interview_noise = rng.normal(0.0, np.sqrt(delta_interview_sq), size=n_workers)
+    tilde_sigma = sigma_true + interview_noise
+
+    var_history = [float(np.var(tilde_sigma))]
+
+    exp_t = np.zeros(n_workers)
+    for _ in range(periods):
+        # Experience growth (always employed in this toy sim)
+        growth = (g0 + g1 * sigma_true) * np.exp(-theta * exp_t)
+        exp_t_plus = exp_t + growth
+
+        # Profit signal with noise
+        eps = rng.normal(0.0, np.sqrt(delta_eps_sq), size=n_workers)
+        profit = exp_t + growth + eps
+
+        # Posterior update weight
+        denom = delta_interview_sq + delta_eps_sq
+        K1 = delta_interview_sq / denom if denom > 0 else 0.0
+        vx = (exp_t_plus * K1) / (1.0 + (exp_t_plus - 1.0) * K1)
+        vx = np.clip(vx, 0.0, 1.0)
+
+        tilde_sigma = (1.0 - vx) * tilde_sigma + vx * profit
+        var_history.append(float(np.var(tilde_sigma)))
+
+        exp_t = exp_t_plus
+
+    return var_history
+
+
+def calibrate_signal_noise(target_ratio: float,
+                           half_life_periods: int = 3,
+                           interview_grid: list[float] | None = None,
+                           eps_grid: list[float] | None = None,
+                           periods: int = 6,
+                           **sim_kwargs):
+    """
+    Grid search (delta_interview_sq, delta_eps_sq) to match posterior variance drop.
+
+    target_ratio: if provided, match Var(t=periods)/Var(t=0) to this value.
+    half_life_periods: if target_ratio is None, enforce a half-life every
+        `half_life_periods` (e.g., ratio at t=3 = 0.5, t=6 = 0.25).
+    periods: number of post-hire periods to simulate; default 6 to check two half-lives.
+    Returns:
+        best (delta_interview_sq, delta_eps_sq, model_ratio, var_history)
+    """
+    if half_life_periods <= 0:
+        raise ValueError("half_life_periods must be positive")
+    interview_grid = interview_grid or [0.05, 0.1, 0.2, 0.4, 0.8]
+    eps_grid = eps_grid or [0.02, 0.05, 0.1, 0.2, 0.4]
+
+    best = None
+    best_gap = float("inf")
+
+    # Build target path: either single ratio or half-life trajectory
+    if target_ratio is not None:
+        target_path = {periods: target_ratio}
+    else:
+        target_path = {
+            t: 0.5 ** (t / half_life_periods)
+            for t in range(1, periods + 1)
+        }
+
+    for d_int in interview_grid:
+        for d_eps in eps_grid:
+            vh = simulate_posterior_variances(
+                delta_interview_sq=d_int,
+                delta_eps_sq=d_eps,
+                periods=periods,
+                **sim_kwargs,
+            )
+            ratios = {t: vh[t] / vh[0] if vh[0] > 0 else np.inf for t in range(1, periods + 1)}
+
+            # gap = average absolute deviation over the target checkpoints
+            gap = float(
+                np.mean([abs(ratios[t] - target_path[t]) for t in target_path])
+            )
+            if gap < best_gap:
+                best_gap = gap
+                best = (d_int, d_eps, ratios, vh, target_path)
+
+    return best
+
+# --------------------------------------------------------
 # 6. 示例：初始化 100 家公司，看一下规模分布
 # --------------------------------------------------------
 
@@ -199,3 +374,33 @@ if __name__ == "__main__":
     # 看看模拟出来的 small/medium/large 比例是否接近现实数据
     print("\n模拟环境中的公司类型占比：")
     print(firms_init["firm_type"].value_counts(normalize=True))
+
+    # --- Empirical wage variance drop ---
+    try:
+        wage_df = load_wage_exp()
+        stats = wage_variance_by_bin(wage_df)
+        ratio = wage_variance_ratio(wage_df)
+        print("\n=== 工资方差按经验分桶 ===")
+        print(stats)
+        print(f"\n经验方差比例 Var(exp≈3)/Var(exp≈0): {ratio:.3f}" if ratio is not None else "无法计算经验方差比例（数据缺失或方差为 0）")
+
+        if ratio is not None:
+            best = calibrate_signal_noise(target_ratio=ratio, periods=3, n_workers=5000, seed=0)
+            if best:
+                d_int, d_eps, ratios, vh, _ = best
+                print("\n=== 建议的信号结构（贴合工资方差比例） ===")
+                print(f"delta_interview_sq ≈ {d_int}, delta_eps_sq ≈ {d_eps}")
+                print(f"模型方差比例 Var_model(t=3)/Var(t=0): {ratios[3]:.3f}")
+                print(f"Var history: {vh}")
+
+        # Half-life target: every 3 periods halves the variance
+        best_half = calibrate_signal_noise(target_ratio=None, periods=6, half_life_periods=3, n_workers=5000, seed=0)
+        if best_half:
+            d_int, d_eps, ratios, vh, target_path = best_half
+            print("\n=== 建议的信号结构（半衰期 3 年：每 3 年方差约减半） ===")
+            print(f"delta_interview_sq ≈ {d_int}, delta_eps_sq ≈ {d_eps}")
+            print("目标轨迹:", {t: round(target_path[t], 3) for t in target_path})
+            print("模型轨迹:", {t: round(ratios[t], 3) for t in ratios})
+            print(f"Var history: {vh}")
+    except FileNotFoundError:
+        print("找不到工资数据文件，跳过工资方差/信号校准示例。")

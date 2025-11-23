@@ -57,7 +57,7 @@ class JobMarketEnv(ParallelEnv):
         num_interview_cost_levels: int = 5,
         action_mode: str = "continuous",
         profit_theta: float = 0.05,
-        profit_noise_var: float = 0.1,
+        profit_noise_var: float = 0.4,
         profit_function_type: str = "linear",
         wage_profit_share: float = 0.5,
         initial_offer_vx: float = 0.0,
@@ -122,7 +122,7 @@ class JobMarketEnv(ParallelEnv):
         )
 
         self.screening = ScreeningMechanism(
-            delta0_sq=1.0,
+            delta0_sq=0.4,
             lam=1.0,
         )
 
