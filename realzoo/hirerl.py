@@ -224,6 +224,16 @@ class JobMarketEnv(ParallelEnv):
             }
         )
         self.obs_size = obs_size
+        self.last_step_finance = {
+            agent: {
+                "profit": 0.0,
+                "wage": 0.0,
+                "screening_cost": 0.0,
+                "firing_cost": 0.0,
+                "reward": 0.0,
+            }
+            for agent in self.agents
+        }
 
     def _capacity(self, firm_idx: int) -> int:
         """
@@ -475,6 +485,11 @@ class JobMarketEnv(ParallelEnv):
             "unemployment_rate": self.worker_pool.get_unemployment_rate(),
             "avg_wage": self.worker_pool.get_average_wage(),
             "timestep": self.timestep,
+            "last_step_profit": float(self.last_step_finance[agent]["profit"]),
+            "last_step_wage": float(self.last_step_finance[agent]["wage"]),
+            "last_step_screening_cost": float(self.last_step_finance[agent]["screening_cost"]),
+            "last_step_firing_cost": float(self.last_step_finance[agent]["firing_cost"]),
+            "last_step_reward": float(self.last_step_finance[agent]["reward"]),
             "worker_metrics": metrics,
         }
 
@@ -496,6 +511,16 @@ class JobMarketEnv(ParallelEnv):
         self.agents = self.possible_agents.copy()
         self.timestep = 0
         self.company_profits = {agent: [0.0] for agent in self.agents}
+        self.last_step_finance = {
+            agent: {
+                "profit": 0.0,
+                "wage": 0.0,
+                "screening_cost": 0.0,
+                "firing_cost": 0.0,
+                "reward": 0.0,
+            }
+            for agent in self.agents
+        }
 
         for agent in self.agents:
             beliefs = FirmBeliefs(num_workers=self.num_workers, ability_dim=self.ability_dim)
@@ -698,16 +723,17 @@ class JobMarketEnv(ParallelEnv):
                     worker = self.worker_pool.workers[worker_id]
                     profit = float(self._last_profit[agent][worker_id])
                     wage_paid = float(worker.wage)
+                    c_fire_t = 6.0 * wage_paid
 
                     decision = firing_decision(
                         p_ijt=profit,
                         w_ijt=wage_paid,
-                        c_fire_t=self.base_firing_cost,
+                        c_fire_t=c_fire_t,
                     )
 
                     if decision.fire:
                         self.worker_pool.fire_worker(worker_id)
-                        firing_costs[agent] += self.base_firing_cost
+                        firing_costs[agent] += c_fire_t
                         self._last_profit[agent][worker_id] = 0.0
                         self._interview_signal_at_hire[agent][worker_id] = 0.0
                         firings_record[agent].append(worker_id)
@@ -722,6 +748,13 @@ class JobMarketEnv(ParallelEnv):
             )
             rewards[agent] = float(reward)
             self.company_profits[agent].append(float(reward))
+            self.last_step_finance[agent] = {
+                "profit": float(total_profits[agent]),
+                "wage": float(total_wages[agent]),
+                "screening_cost": float(screening_costs[agent]),
+                "firing_cost": float(firing_costs[agent]),
+                "reward": float(reward),
+            }
 
         self.timestep += 1
 

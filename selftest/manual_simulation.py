@@ -65,8 +65,17 @@ def print_worker_metrics(infos: Dict[str, Dict], step: int):
 
 def load_realistic_env(num_firms: int = 5,
                        employees_per_agent: float = 1_000.0,
-                       random_state: int | None = None) -> Tuple[JobMarketEnv, List[str]]:
-    """Build an env seeded by real firm sizes and wage premia."""
+                       random_state: int | None = 42,
+                       seed: int | None = 42) -> Tuple[JobMarketEnv, List[str]]:
+    """
+    Build an env seeded by real firm sizes and wage premia.
+    employees_per_agent 就是一把比例尺。公式很简单：
+
+  capacity_i = round(公司真实员工数_i / employees_per_agent)
+
+  - 如果设得小（比如 500），真实 5,000 人的公司 → capacity ≈ 10；1,000,000 人的公司 → capacity ≈ 2,000，巨头在环境里也很大，总 worker 数会暴涨。
+  - 如果设得大（比如 5,000），同样的 5,000 人公司 → capacity ≈ 1；1,000,000 人公司 → capacity ≈ 200，巨头被压缩得更紧，总 worker 数变小。
+    """
     firms_df = initialize_firms(num_firms=num_firms,
                                 type_config=firms_type_config,
                                 random_state=random_state)
@@ -76,23 +85,28 @@ def load_realistic_env(num_firms: int = 5,
 
     num_workers = sum(capacities)
     env = JobMarketEnv(
-        num_companies=len(capacities),
-        num_workers=num_workers,
+        num_companies=len(capacities), #capacities： 每家实际雇佣的人数
+        num_workers=num_workers, #劳动力池的总人数
         firm_capacities=capacities,
         firm_types=firm_types,
         firm_type_premia=premia,
         ability_dim=1,
         action_mode="continuous",
         max_interview_cost=2.0,
-        profit_noise_var=0.4,
+        profit_noise_var=0.0,  # disable profit noise for determinism
+        max_timesteps=100,
+        seed=seed,
     )
+    # Make interview signals effectively deterministic by shrinking noise and seeding
+    env.screening.delta0_sq = 1e-9
+    env.screening._rng = np.random.RandomState(seed)
     return env, firm_types
 
 
 def run_manual_simulation():
-    env, firm_types = load_realistic_env(num_firms=5, employees_per_agent=1_000.0, random_state=None)
+    env, firm_types = load_realistic_env(num_firms=5, employees_per_agent=2000, random_state=42, seed=42)
 
-    observations, infos = env.reset()
+    observations, infos = env.reset(seed=42)
     print_worker_metrics(infos, step=0)
     print(f"Firm types: {firm_types}")
 
@@ -102,10 +116,13 @@ def run_manual_simulation():
     hiring_events = defaultdict(list)
     hire_counts = defaultdict(list)
     fire_counts = defaultdict(list)
+    finance_series = defaultdict(lambda: {'t': [], 'profit': [], 'wage': [], 'firing_cost': [], 'reward': []})
     total_hires_per_step: List[int] = []
     total_fires_per_step: List[int] = []
     step_indices: List[int] = []
-    horizon = 10
+    horizon = 100
+    force_events = True  # push hires/fires early for visualization
+    force_window = 20    # only force within first N steps
     for step in range(1, horizon + 1):
         actions = {}
         for agent in env.agents:
@@ -114,10 +131,30 @@ def run_manual_simulation():
             actions[agent] = choose_manual_action(
                 action_space, action_mask, env.max_interview_cost
             )
+            if force_events and step <= force_window:
+                # Force maximum interview effort to trigger matching/hiring
+                if hasattr(action_space, "n"):  # discrete
+                    actions[agent] = float(env.action_size - 1)
+                else:  # continuous
+                    actions[agent] = float(env.max_interview_cost)
 
         observations, rewards, terminations, truncations, infos = env.step(actions)
 
         print(f"\nStep {step} rewards: {rewards}")
+        for agent in env.possible_agents:
+            info = infos.get(agent, {})
+            if info:
+                print(
+                    f"  {agent}: profit={info.get('last_step_profit', 0.0):+.2f}, "
+                    f"wages={info.get('last_step_wage', 0.0):+.2f}, "
+                    f"firing_cost={info.get('last_step_firing_cost', 0.0):+.2f}, "
+                    f"reward={info.get('last_step_reward', 0.0):+.2f}"
+                )
+                finance_series[agent]['t'].append(step)
+                finance_series[agent]['profit'].append(info.get('last_step_profit', 0.0))
+                finance_series[agent]['wage'].append(info.get('last_step_wage', 0.0))
+                finance_series[agent]['firing_cost'].append(info.get('last_step_firing_cost', 0.0))
+                finance_series[agent]['reward'].append(info.get('last_step_reward', 0.0))
         print_worker_metrics(infos, step=step)
         step_total_hires = 0
         step_total_fires = 0
@@ -155,10 +192,24 @@ def run_manual_simulation():
                 for worker_id in fires:
                     firing_events[(agent, worker_id)].append(step)
 
+        # Optionally force a firing event for plotting within the window
+        if force_events and step <= force_window:
+            for agent in env.agents:
+                info = infos.get(agent, {})
+                company_idx = int(agent.split("_")[-1])
+                workforce = env.worker_pool.get_employed_by_company(company_idx)
+                if workforce and not info.get("firings"):
+                    victim = workforce[0]
+                    env.worker_pool.fire_worker(victim)
+                    info.setdefault("firings", []).append(victim)
+                    firings_record = firings_record if 'firings_record' in locals() else {}
+                    firing_events[(agent, victim)].append(step)
+
         total_hires_per_step.append(step_total_hires)
         total_fires_per_step.append(step_total_fires)
         step_indices.append(step)
-        if all(terminations.values()) or all(truncations.values()):
+        # Only break early if the env actually reports termination/truncation flags
+        if (terminations and all(terminations.values())) or (truncations and all(truncations.values())):
             print("Episode ended early.")
             break
 
@@ -218,6 +269,23 @@ def run_manual_simulation():
         plt.legend(uniq_handles, uniq_labels)
         plt.tight_layout()
         plt.savefig(plot_dir / f'{agent}_worker{worker_id}_sigma.png')
+        plt.close()
+
+    # Finance series per firm
+    for agent, data in finance_series.items():
+        if not data['t']:
+            continue
+        plt.figure()
+        plt.plot(data['t'], data['profit'], label='profit')
+        plt.plot(data['t'], data['wage'], label='wage')
+        plt.plot(data['t'], data['firing_cost'], label='firing_cost')
+        plt.plot(data['t'], data['reward'], label='reward (net)')
+        plt.xlabel('timestep')
+        plt.ylabel('value')
+        plt.title(f'{agent} finance per timestep')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_dir / f'{agent}_finance.png')
         plt.close()
 
     if step_indices:

@@ -10,40 +10,39 @@
 
 import pandas as pd
 import numpy as np
-import re
+import sys
 
+
+def _coerce_numeric(series: pd.Series, col_name: str) -> pd.Series:
+    """
+    Lightly clean a numeric column: strip whitespace (incl. NBSP) and commas,
+    coerce to numeric, and report rows that become NaN.
+    """
+    cleaned = (
+        series.astype(str)
+        .str.replace("\u00a0", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+    )
+    numeric = pd.to_numeric(cleaned)
+    bad = numeric.isna() & series.notna()
+    if bad.any():
+        print(f"[clean] dropped {bad.sum()} non-numeric values in '{col_name}'")
+    return numeric
 # --------------------------------------------------------
 # 数据清洗 & 经验方差目标提取
 # --------------------------------------------------------
-
-
-def _extract_number(val):
-    """Take a messy string like 'US$302,000' or '6 yrs' and return float."""
-    if pd.isna(val):
-        return np.nan
-    s = str(val)
-    s = s.replace(",", "")
-    match = re.findall(r"[0-9]+(?:\\.[0-9]+)?", s)
-    if not match:
-        return np.nan
-    try:
-        return float(match[0])
-    except ValueError:
-        return np.nan
-
 
 def load_wage_exp(excel_path: str = None,
                   exp_col: str = "year of experience",
                   wage_col: str = "salary") -> pd.DataFrame:
     """
-    Load and clean wage/experience data from Excel for variance calibration.
+    Load wage/experience data (light numeric coercion to handle stray strings).
     """
     path = excel_path or EXCEL_PATH
     df = pd.read_excel(path, usecols=[exp_col, wage_col])
-    df[exp_col] = df[exp_col].apply(_extract_number)
-    df[wage_col] = df[wage_col].apply(_extract_number)
-    df = df.dropna(subset=[exp_col, wage_col])
-    df = df[df[exp_col] >= 0]
+    df[exp_col] = _coerce_numeric(df[exp_col], exp_col)
+    df[wage_col] = _coerce_numeric(df[wage_col], wage_col)
     return df
 
 
@@ -55,6 +54,8 @@ def wage_variance_by_bin(df: pd.DataFrame,
     Bin wages by floor(experience) and return count/mean/variance per bin.
     """
     work = df.copy()
+    work[exp_col] = _coerce_numeric(work[exp_col], exp_col)
+    work[wage_col] = _coerce_numeric(work[wage_col], wage_col)
     work["exp_bin"] = work[exp_col].apply(lambda x: int(np.floor(x)))
     if max_bin is not None:
         work = work[work["exp_bin"] <= max_bin]
@@ -113,12 +114,9 @@ def load_wage_exp_with_size(excel_path: str = None,
     path = excel_path or EXCEL_PATH
     usecols = [exp_col, wage_col, emp_col]
     df = pd.read_excel(path, usecols=usecols)
-    df[exp_col] = df[exp_col].apply(_extract_number)
-    df[wage_col] = df[wage_col].apply(_extract_number)
-    df[emp_col] = df[emp_col].apply(_extract_number)
-    df = df.dropna(subset=[exp_col, wage_col, emp_col])
-    df = df[df[exp_col] >= 0]
-    df = df[df[emp_col] > 0]
+    df[exp_col] = _coerce_numeric(df[exp_col], exp_col)
+    df[wage_col] = _coerce_numeric(df[wage_col], wage_col)
+    df[emp_col] = _coerce_numeric(df[emp_col], emp_col)
 
     # 使用与公司规模初始化相同的 q50 / q90 阈值划分 firm_type
     def _firm_type_from_emp(emp: float) -> str:
@@ -193,11 +191,10 @@ def estimate_size_wage_premia(excel_path: str = None,
 # --------------------------------------------------------
 
 # 这里填你的真实路径；如果在本地/服务器上运行，这个路径要改成你的实际位置
-EXCEL_PATH = "/Users/joehisaishi/Library/CloudStorage/GoogleDrive-zhaijing@uw.edu/.shortcut-targets-by-id/1A8EblAG1p82E-7dXusgeL8h9ait30Ed9/Job Matching RL/sde_cleaned.xlsx"
+EXCEL_PATH = "/Users/joehisaishi/Library/CloudStorage/GoogleDrive-zhaijing@uw.edu/.shortcut-targets-by-id/1A8EblAG1p82E-7dXusgeL8h9ait30Ed9/Job Matching RL/sde_cleaned_Nov24.xlsx"
 
 # 读入 Excel（默认读第一张表，如果你有多张表可以加 sheet_name 参数）
 df = pd.read_excel(EXCEL_PATH)
-
 # 假设列名就是 employee_count，如果不一样这里改一下
 EMP_COL = "employee_count"
 
@@ -207,13 +204,15 @@ if EMP_COL not in df.columns:
 
 # 提取这一列，并复制一份，避免直接改原 df
 emp_counts = df[EMP_COL].copy()
+print(f"员工数1是{emp_counts}")
+emp_counts = _coerce_numeric(emp_counts, EMP_COL)
+print(f"员工数2是{emp_counts}")
 
 # --------------------------------------------------------
 # 2. 基础清洗：去掉缺失、非正数、极端异常值
 # --------------------------------------------------------
 
-# 去掉缺失值
-emp_counts = emp_counts.dropna()
+
 
 # 只保留 > 0 的值（0 或负数一般是脏数据或不想要的）
 emp_counts = emp_counts[emp_counts > 0]
@@ -232,6 +231,7 @@ print(f"清洗后剩余公司数量: {len(emp_counts)}")
 # --------------------------------------------------------
 
 # 计算一些关键分位数：中位数（50%）、90% 分位
+# Q50 / Q90 用于定义 small/medium/large 阈值。
 q50 = emp_counts.quantile(0.5)
 # 用 interpolation="higher" 保证 q90 取到实际数据点，避免 q90 等于 max 时出现“> q90”为空
 q90 = emp_counts.quantile(0.9, interpolation="higher")
@@ -263,7 +263,7 @@ print(f"中公司 (Q50 ~ Q90): {n_medium} 家，占比 {p_medium:.2%}")
 print(f"大公司 (> Q90): {n_large} 家，占比 {p_large:.2%}")
 
 # 为了初始化时给每类一个“代表性规模”，
-# 我们取各类内部的中位数作为代表值（也可以用均值）
+# 取各类内部的中位数作为代表值（也可以用均值），用于后面抽样初始化。
 rep_small = emp_counts[small_mask].median()
 rep_medium = emp_counts[medium_mask].median()
 rep_large = emp_counts[large_mask].median()
@@ -322,7 +322,7 @@ def initialize_firms(num_firms: int,
     """
     rng = np.random.default_rng(random_state)
 
-    # 取出类型列表和对应概率
+    # 取出类型列表和对应概率，按真实占比抽样 firm_type
     types = list(type_config.keys())
     probs = np.array([type_config[t]["prob"] for t in types], dtype=float)
 
@@ -333,7 +333,7 @@ def initialize_firms(num_firms: int,
     sampled_types_idx = rng.choice(len(types), size=num_firms, p=probs)
     sampled_types = [types[i] for i in sampled_types_idx]
 
-    # 给每家公司一个代表性初始规模
+    # 给每家公司一个代表性初始规模（按对应类型的 rep_size）
     init_sizes = [type_config[t]["rep_size"] for t in sampled_types]
 
     # 组织成一个 DataFrame，方便后面丢给 MARL 环境
@@ -352,8 +352,8 @@ def to_env_capacities(firms_df: pd.DataFrame,
     """
     Map real employee counts to MARL environment capacities.
 
-    employees_per_agent controls how many real employees correspond to one
-    simulated worker slot. Increase it to compress very large firms.
+    employees_per_agent: 多少真实员工换算成 1 个“虚拟工人”槽位。
+    较大的比例尺会压缩巨头容量，减少总 num_workers。
     """
     if employees_per_agent <= 0:
         raise ValueError("employees_per_agent must be positive")
@@ -378,6 +378,13 @@ def simulate_posterior_variances(delta_interview_sq: float,
     Run a lightweight Monte Carlo that mirrors the paper's belief update.
 
     Returns a list of Var(tilde_sigma_t) for t=0..periods.
+
+    关键公式：
+      interview: tilde_sigma = sigma_true + N(0, delta_interview_sq)
+      profit: profit = exp_t + growth + N(0, delta_eps_sq)
+      K1 = delta_interview_sq / (delta_interview_sq + delta_eps_sq)
+      v_x = (exp_t * K1) / (1 + (exp_t - 1) * K1)
+      tilde_sigma_{t+1} = (1 - v_x) * tilde_sigma + v_x * profit
     """
     rng = np.random.default_rng(seed)
     sigma_true = rng.normal(0.0, 1.0, size=n_workers)
@@ -427,6 +434,9 @@ def calibrate_signal_noise(target_ratio: float,
     periods: number of post-hire periods to simulate; default 6 to check two half-lives.
     Returns:
         best (delta_interview_sq, delta_eps_sq, model_ratio, var_history)
+
+    思路：遍历 (delta_interview_sq, delta_eps_sq) 网格，跑上面的仿真，
+    把 Var(t)/Var(0) 与目标轨迹比较，找平均误差最小的组合。
     """
     if half_life_periods <= 0:
         raise ValueError("half_life_periods must be positive")
@@ -468,6 +478,7 @@ def calibrate_signal_noise(target_ratio: float,
 # --------------------------------------------------------
 # 6. 示例：初始化 100 家公司，看一下规模分布
 # --------------------------------------------------------
+
 
 if __name__ == "__main__":
     num_firms = 100
