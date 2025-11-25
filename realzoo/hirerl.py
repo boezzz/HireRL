@@ -181,25 +181,39 @@ class JobMarketEnv(ParallelEnv):
             dtype=np.float32,
         ) #这还是discrete的。
 
+        # Action space: cost vector for ALL workers
+        # Policy outputs interview costs for each worker; environment uses the 
+        # cost for the worker assigned to each firm
+        self.action_low = 0.0
+        self.action_high = float(self.max_interview_cost)
+        
         if self.action_mode == "continuous":
-            self.action_low = 0.0
-            self.action_high = float(self.max_interview_cost)
-            self.action_size = 1
+            # Continuous: Box(shape=(num_workers,)) - one cost per worker
+            self.action_size = num_workers
             self.idle_action = None
             self._action_spaces = {
                 agent: Box(
-                    low=np.array([self.action_low], dtype=np.float32),
-                    high=np.array([self.action_high], dtype=np.float32),
+                    low=np.zeros(num_workers, dtype=np.float32),
+                    high=np.full(num_workers, self.action_high, dtype=np.float32),
                     dtype=np.float32,
                 )
                 for agent in self.agents
             }
         else:
-            self.action_low = 0.0
-            self.action_high = float(self.max_interview_cost)
-            self.action_size = self.num_interview_cost_levels
+            # Discrete: still per-worker, but discretized levels
+            # Each worker has num_interview_cost_levels options
+            # For simplicity, we use MultiDiscrete or keep as continuous
+            # Here we fall back to continuous for discrete mode too
+            self.action_size = num_workers
             self.idle_action = 0
-            self._action_spaces = {agent: Discrete(self.action_size) for agent in self.agents}
+            self._action_spaces = {
+                agent: Box(
+                    low=np.zeros(num_workers, dtype=np.float32),
+                    high=np.full(num_workers, self.action_high, dtype=np.float32),
+                    dtype=np.float32,
+                )
+                for agent in self.agents
+            }
 
         obs_size = (
             num_workers * ability_dim  # sigma_hat public belief.
@@ -212,6 +226,7 @@ class JobMarketEnv(ParallelEnv):
             + num_workers  # own workforce indicator
             + 1  # own profit
         )
+        # Action mask: one per worker (which workers can be interviewed)
         obs_space = GymDict(
             {
                 "observation": Box(
@@ -220,10 +235,14 @@ class JobMarketEnv(ParallelEnv):
                     shape=(obs_size,),
                     dtype=np.float32,
                 ),
-                "action_mask": MultiBinary(self.action_size),
+                "action_mask": MultiBinary(num_workers),  # One mask per worker
             }
         )
         self.obs_size = obs_size
+        self._observation_spaces = {agent: obs_space for agent in self.agents}
+        
+        self.timestep = 0
+        self.company_profits: Dict[str, List[float]] = {agent: [] for agent in self.agents}
         self.last_step_finance = {
             agent: {
                 "profit": 0.0,
@@ -249,12 +268,6 @@ class JobMarketEnv(ParallelEnv):
             t = self.firm_types[firm_idx]
             return float(self.firm_type_premia.get(t, 1.0))
         return 1.0
-
-        self._observation_spaces = {agent: obs_space for agent in self.agents}
-
-        self.timestep = 0
-        self.company_profits: Dict[str, List[float]] = {agent: [] for agent in self.agents}
-        self.rng = np.random.RandomState(seed)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -315,24 +328,29 @@ class JobMarketEnv(ParallelEnv):
 
         return assignments
 
-    def _cost_from_action(self, action: Any) -> float:
+    def _cost_from_action(self, action: Any) -> np.ndarray:
         """
-        Map a policy action (index or float) into an interview cost scalar.
+        Map a policy action (vector of costs) into a cost array for all workers.
 
         Returns:
-            float cost in [action_low, action_high]; if discrete, looks up
-            `cost_levels[idx]`.
-
-            no matter is discrete or cns, it returns a scalar (which is correct).
+            np.ndarray of shape (num_workers,) with costs in [action_low, action_high].
         """
-        if self.action_mode == "discrete":
-            idx = int(np.clip(int(action), 0, self.action_size - 1))
-            return float(self.cost_levels[idx])
-        if isinstance(action, (list, tuple, np.ndarray)):
-            value = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
-        else:
-            value = float(action)
-        return float(np.clip(value, self.action_low, self.action_high))
+        if action is None:
+            return np.zeros(self.num_workers, dtype=np.float32)
+        
+        action_arr = np.asarray(action, dtype=np.float32).flatten()
+        
+        # Handle legacy scalar actions (backwards compatibility)
+        if action_arr.shape[0] == 1:
+            # Broadcast single value to all workers
+            action_arr = np.full(self.num_workers, action_arr[0], dtype=np.float32)
+        elif action_arr.shape[0] != self.num_workers:
+            raise ValueError(
+                f"Action shape {action_arr.shape} doesn't match num_workers={self.num_workers}"
+            )
+        
+        # Clip to valid range
+        return np.clip(action_arr, self.action_low, self.action_high)
 
     def _compute_vx(self, exp_t: float, delta_interview_sq: float) -> float:
         """
@@ -387,21 +405,18 @@ class JobMarketEnv(ParallelEnv):
         Build the valid-action mask for `agent`.
 
         Returns:
-            In continuous mode: all ones of shape `(1,)`.
-            In discrete mode: binary vector of length `action_size` where only
-            NO_OP is valid for firms without an assignment.
+            Binary vector of length (num_workers,) where:
+            - mask[j] = 1 if worker j is unemployed (could potentially be interviewed)
+            - mask[j] = 0 if worker j is employed
+            
+            Note: The actual assignment is deterministic based on firm priority,
+            but the mask indicates which workers are available in the market.
         """
-        if self.action_mode == "continuous":
-            return np.ones(self.action_size, dtype=np.int8)
-
-        assignments = self._deterministic_interview_assignments()
-        company_idx = self._company_index(agent)
-        mask = np.zeros(self.action_size, dtype=np.int8)
-
-        if company_idx not in assignments:
-            mask[self.idle_action] = 1
-        else:
-            mask[:] = 1
+        # Mask indicates which workers are unemployed (available for interview)
+        mask = np.array(
+            [1 if w.employed_by == -1 else 0 for w in self.worker_pool.workers],
+            dtype=np.int8
+        )
         return mask
 
     def _get_obs(self, agent: str) -> Dict[str, np.ndarray]:
@@ -563,7 +578,7 @@ class JobMarketEnv(ParallelEnv):
         return observations, infos
 
     def step(
-        self, actions: Dict[str, int]
+        self, actions: Dict[str, np.ndarray]
     ) -> Tuple[
         Dict[str, Dict[str, np.ndarray]],
         Dict[str, float],
@@ -575,15 +590,18 @@ class JobMarketEnv(ParallelEnv):
         Execute one environment timestep.
 
         Args:
-            actions: dict mapping agent name to either interview cost (float) or
-                     discrete index, depending on action mode.
+            actions: dict mapping agent name to cost vector (num_workers,) array.
+                     Each element is the interview cost the firm would spend on
+                     that worker if assigned. The environment uses the cost for
+                     the actually assigned worker.
         Returns:
             tuple of (observations, rewards, terminations, truncations, infos),
             each a dict keyed by agent names.
         """
-        decoded_actions: Dict[str, float] = {}
+        # Decode actions: each agent's action is now a (num_workers,) cost vector
+        decoded_actions: Dict[str, np.ndarray] = {}
         for agent in self.agents:
-            default = 0 if self.action_mode == "discrete" else 0.0
+            default = np.zeros(self.num_workers, dtype=np.float32)
             decoded_actions[agent] = self._cost_from_action(actions.get(agent, default))
 
         for agent in self.agents:
@@ -617,7 +635,8 @@ class JobMarketEnv(ParallelEnv):
 
                 worker_id = assignments[company_idx]
                 worker = self.worker_pool.workers[worker_id]
-                cost = decoded_actions[agent]
+                # Extract the cost for THIS worker from the full cost vector
+                cost = float(decoded_actions[agent][worker_id])
 
                 screening_costs[agent] += cost
                 self._current_interview_costs[agent][worker_id] = cost

@@ -93,12 +93,14 @@ class ActorCritic(nn.Module):
         if self.action_type == "continuous":
             # Output mean cost for each worker
             self.actor_mean = layer_init(nn.Linear(hidden_dim, num_workers), std=0.01)
-            self.log_std = nn.Parameter(torch.zeros(num_workers))
+            # Initialize log_std to -0.5 (std ≈ 0.6) for more focused exploration
+            # This will be clamped during forward pass to prevent runaway growth
+            self.log_std = nn.Parameter(torch.full((num_workers,), -0.5))
         else:
             # For discrete mode: output continuous costs, then discretize
             # This is simpler than separate discrete distributions per worker
             self.actor_mean = layer_init(nn.Linear(hidden_dim, num_workers), std=0.01)
-            self.log_std = nn.Parameter(torch.zeros(num_workers))
+            self.log_std = nn.Parameter(torch.full((num_workers,), -0.5))
 
         self.critic = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
 
@@ -127,7 +129,8 @@ class ActorCritic(nn.Module):
 
         # Both continuous and discrete use same approach: output costs for all workers
         mean = self.actor_mean(features)
-        log_std = self.log_std.expand_as(mean)
+        # Clamp log_std to prevent runaway growth: std in [0.3, 1.5]
+        log_std = torch.clamp(self.log_std, min=-1.2, max=0.4).expand_as(mean)
         std = torch.exp(log_std)
         dist = Normal(mean, std)
         raw_action = mean if deterministic else dist.rsample()
@@ -180,7 +183,8 @@ class ActorCritic(nn.Module):
 
         # Treat as continuous actions for all workers
         mean = self.actor_mean(features)
-        log_std = self.log_std.expand_as(mean)
+        # Clamp log_std to prevent runaway growth: std in [0.3, 1.5]
+        log_std = torch.clamp(self.log_std, min=-1.2, max=0.4).expand_as(mean)
         std = torch.exp(log_std)
         dist = Normal(mean, std)
 
@@ -191,82 +195,6 @@ class ActorCritic(nn.Module):
         entropy = dist.entropy().sum(dim=-1)
 
         return log_probs, value, entropy
-
-
-def compute_assigned_worker(
-    obs_dict: Dict[str, np.ndarray],
-    num_workers: int,
-    ability_dim: int,
-    company_idx: int,
-    num_companies: int,
-    max_workers_per_company: int
-) -> Optional[int]:
-    """
-    Recompute which worker this firm is assigned to interview.
-
-    Uses the same deterministic logic as the environment:
-    - Firms ordered by size (largest first)
-    - Each firm targets highest public-signal unemployed worker
-    - Workers assigned to firms in priority order
-
-    Args:
-        obs_dict: Observation dictionary containing 'observation' array
-        num_workers: Number of workers
-        ability_dim: Dimension of ability vector
-        company_idx: Index of this firm
-        num_companies: Total number of firms
-        max_workers_per_company: Maximum workforce size
-
-    Returns:
-        worker_id that this firm should interview, or None if no assignment
-    """
-    obs = obs_dict['observation'] if isinstance(obs_dict, dict) else obs_dict
-
-    # Parse observation (must match hirerl.py _get_obs format)
-    # Format: sigma_hat (N*D) + experience (N) + tenure (N) + employed_by (N) +
-    #         wages (N) + belief_mean (N*D) + belief_var (N*D) + own_workforce (N) + profit (1)
-    ptr = 0
-    sigma_hat = obs[ptr:ptr + num_workers * ability_dim].reshape(num_workers, ability_dim)
-    ptr += num_workers * ability_dim
-    experience = obs[ptr:ptr + num_workers]
-    ptr += num_workers
-    tenure = obs[ptr:ptr + num_workers]
-    ptr += num_workers
-    employed_by = obs[ptr:ptr + num_workers]
-    ptr += num_workers
-
-    # Find unemployed workers (employed_by == -1)
-    unemployed = [i for i in range(num_workers) if employed_by[i] == -1]
-    if not unemployed:
-        return None
-
-    # Sort unemployed by public signal (highest first)
-    unemployed_sorted = sorted(unemployed, key=lambda j: float(sigma_hat[j, 0]), reverse=True)
-
-    # Compute firm sizes and priority order
-    firm_sizes = {}
-    for firm_idx in range(num_companies):
-        # Count workers employed by this firm
-        firm_sizes[firm_idx] = int(np.sum(employed_by == firm_idx))
-
-    # Sort firms by size (largest first), break ties by firm index
-    firm_order = sorted(firm_sizes.keys(), key=lambda k: (-firm_sizes[k], k))
-
-    # Assign workers to firms in priority order
-    idx = 0
-    for firm_idx in firm_order:
-        current_workforce = firm_sizes[firm_idx]
-        if current_workforce >= max_workers_per_company:
-            continue
-        if idx >= len(unemployed_sorted):
-            break
-
-        if firm_idx == company_idx:
-            return unemployed_sorted[idx]
-
-        idx += 1
-
-    return None
 
 
 class RolloutBuffer:
@@ -311,6 +239,35 @@ class RolloutBuffer:
         }
 
 
+class RunningMeanStd:
+    """Running mean and standard deviation for reward normalization."""
+    
+    def __init__(self, epsilon: float = 1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon
+    
+    def update(self, x: np.ndarray):
+        """Update running statistics with a batch of values."""
+        batch_mean = np.mean(x)
+        batch_var = np.var(x)
+        batch_count = len(x)
+        
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        
+        self.mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta ** 2 * self.count * batch_count / total_count
+        self.var = M2 / total_count
+        self.count = total_count
+    
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        """Normalize values using running statistics."""
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
+
 class PPOAgent:
     """
     Proximal Policy Optimization agent supporting both action types.
@@ -334,7 +291,8 @@ class PPOAgent:
         value_coef: float = 0.5,
         entropy_coef: float = 0.01,
         max_grad_norm: float = 0.5,
-        device: str = 'cpu'
+        device: str = 'cpu',
+        normalize_rewards: bool = True
     ):
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -345,6 +303,10 @@ class PPOAgent:
         self.device = device
         self.action_type = action_type
         self.num_workers = num_workers
+        self.normalize_rewards = normalize_rewards
+        
+        # Running statistics for reward normalization
+        self.reward_rms = RunningMeanStd() if normalize_rewards else None
 
         self.network = ActorCritic(
             obs_dim=obs_dim,
@@ -361,29 +323,22 @@ class PPOAgent:
     def get_action(
         self,
         obs_dict,
-        company_idx: int,
-        num_companies: int,
-        ability_dim: int,
-        max_workers_per_company: int,
         deterministic: bool = False
     ):
         """
         Get action for environment.
 
-        Network outputs interview costs for ALL workers, then we extract the
-        cost for the specific worker assigned to this firm.
+        Network outputs interview costs for ALL workers. The full cost vector
+        is passed to the environment, which extracts the relevant cost for
+        the assigned worker.
 
         Args:
             obs_dict: Observation dictionary
-            company_idx: Index of this company
-            num_companies: Total number of companies
-            ability_dim: Dimension of ability vector
-            max_workers_per_company: Max workforce size
             deterministic: Whether to use deterministic policy
 
         Returns:
-            env_action: Scalar interview cost for assigned worker
-            stored_raw: Full raw action vector (num_workers,) for training
+            env_action: Full cost vector (num_workers,) for environment
+            raw_action: Unsquashed cost vector for training
             value: State value
             log_prob: Joint log probability over all workers
         """
@@ -401,28 +356,11 @@ class PPOAgent:
                 deterministic=deterministic,
             )
 
-        # Extract costs for all workers
-        all_costs = action.squeeze(0).cpu().numpy()  # (num_workers,)
-        stored_raw = raw_action.squeeze(0).cpu().numpy()  # (num_workers,)
+        # Return full cost vector - environment will extract the relevant one
+        env_action = action.squeeze(0).cpu().numpy()  # (num_workers,)
+        raw_action_np = raw_action.squeeze(0).cpu().numpy()  # (num_workers,)
 
-        # Determine which worker is assigned to this firm
-        assigned_worker = compute_assigned_worker(
-            obs_dict=obs_dict,
-            num_workers=self.num_workers,
-            ability_dim=ability_dim,
-            company_idx=company_idx,
-            num_companies=num_companies,
-            max_workers_per_company=max_workers_per_company
-        )
-
-        # Extract cost for assigned worker
-        if assigned_worker is not None:
-            env_action = float(all_costs[assigned_worker])
-        else:
-            # No assignment: return zero cost (no-op)
-            env_action = 0.0
-
-        return env_action, stored_raw, value.item(), log_prob.item()
+        return env_action, raw_action_np, value.item(), log_prob.item()
 
     def compute_gae(self, rewards, values, dones, next_value):
         """Compute Generalized Advantage Estimation."""
@@ -452,6 +390,15 @@ class PPOAgent:
 
         # Get rollout data
         data = self.buffer.get()
+        
+        # Normalize rewards using running statistics
+        rewards = data['rewards']
+        if self.normalize_rewards and self.reward_rms is not None:
+            self.reward_rms.update(rewards)
+            rewards = self.reward_rms.normalize(rewards)
+            # Clip normalized rewards to prevent extreme values
+            rewards = np.clip(rewards, -10, 10)
+        data['rewards'] = rewards
 
         if isinstance(next_obs_dict, dict):
             next_obs = next_obs_dict['observation']
@@ -752,7 +699,6 @@ class IPPOTrainer:
         # Track interview cost statistics
         interview_costs = []
         all_worker_costs = {agent: [] for agent in self.env.possible_agents}  # Track costs for ALL workers
-        assigned_worker_ids = {agent: [] for agent in self.env.possible_agents}
 
         # Track environment actions (hires, fires)
         episode_hires = {agent: 0 for agent in self.env.possible_agents}
@@ -769,39 +715,25 @@ class IPPOTrainer:
 
             for agent_name in self.env.agents:
                 agent = self.agents[agent_name]
-                company_idx = int(agent_name.split('_')[1])
 
+                # Get full cost vector for all workers
                 env_action, raw_action, value, log_prob = agent.get_action(
                     obs_dict=observations[agent_name],
-                    company_idx=company_idx,
-                    num_companies=self.env.num_companies,
-                    ability_dim=self.env.ability_dim,
-                    max_workers_per_company=self.env.max_workers_per_company,
                     deterministic=False
                 )
 
-                # Recompute assigned worker for logging
-                assigned_worker = compute_assigned_worker(
-                    obs_dict=observations[agent_name],
-                    num_workers=self.env.num_workers,
-                    ability_dim=self.env.ability_dim,
-                    company_idx=company_idx,
-                    num_companies=self.env.num_companies,
-                    max_workers_per_company=self.env.max_workers_per_company
-                )
-
-                # env_action is scalar cost for assigned worker
-                # raw_action is (num_workers,) vector of all costs
-                actions[agent_name] = env_action
+                # env_action is (num_workers,) cost vector
+                # Environment will extract the cost for the assigned worker
+                actions[agent_name] = env_action  # Full vector to environment
                 values[agent_name] = value
                 log_probs[agent_name] = log_prob
-                raw_actions[agent_name] = raw_action  # Store full vector
-                interview_costs.append(env_action)
+                raw_actions[agent_name] = raw_action  # Store full vector for training
 
-                # Track full action distribution
-                all_worker_costs[agent_name].append(raw_action)  # (num_workers,) per step
-                if assigned_worker is not None:
-                    assigned_worker_ids[agent_name].append(assigned_worker)
+                # Track full action distribution for logging
+                all_worker_costs[agent_name].append(env_action)  # (num_workers,) per step
+                
+                # Track mean cost for logging (across all workers)
+                interview_costs.append(float(np.mean(env_action)))
 
             # Step environment
             next_observations, rewards, terminations, truncations, infos = self.env.step(actions)
@@ -843,10 +775,12 @@ class IPPOTrainer:
             if self.log_step_data:
                 for agent_name in self.env.agents:
                     reward = rewards.get(agent_name, 0.0)
+                    # Log mean action across all workers (action is now a vector)
+                    action_mean = float(np.mean(actions[agent_name]))
                     self._step_log_buffer.append({
                         'global_step': self.global_step,
                         'agent': agent_name,
-                        'action': actions[agent_name],
+                        'action': action_mean,
                         'reward': reward
                     })
 
@@ -945,26 +879,12 @@ class IPPOTrainer:
                                 self.global_step
                             )
 
-                    # Log which workers were assigned most frequently
-                    if assigned_worker_ids[agent_name]:
-                        worker_counts = np.bincount(
-                            assigned_worker_ids[agent_name],
-                            minlength=self.env.num_workers
-                        )
-                        for worker_id in range(self.env.num_workers):
-                            self.writer.add_scalar(
-                                f"assignments/{agent_name}/worker_{worker_id}_frequency",
-                                worker_counts[worker_id],
-                                self.global_step
-                            )
-
                 # Reset environment and episode tracking
                 observations, _ = self.env.reset()
                 current_episode_rewards = {agent: 0.0 for agent in self.env.possible_agents}
                 episode_length = 0
                 interview_costs = []
                 all_worker_costs = {agent: [] for agent in self.env.possible_agents}
-                assigned_worker_ids = {agent: [] for agent in self.env.possible_agents}
                 episode_hires = {agent: 0 for agent in self.env.possible_agents}
                 episode_fires = {agent: 0 for agent in self.env.possible_agents}
                 total_hires = 0
@@ -1100,28 +1020,13 @@ class IPPOTrainer:
                 # Get actions (deterministic for evaluation)
                 actions = {}
                 for agent_name in self.env.agents:
-                    company_idx = int(agent_name.split('_')[1])
-
                     # Get full cost vector from network
+                    # Environment will extract the cost for the assigned worker
                     all_costs = self.agents[agent_name].network.get_action(
                         observations[agent_name],
                         deterministic=deterministic
                     )
-
-                    # Extract cost for assigned worker
-                    assigned_worker = compute_assigned_worker(
-                        obs_dict=observations[agent_name],
-                        num_workers=self.env.num_workers,
-                        ability_dim=self.env.ability_dim,
-                        company_idx=company_idx,
-                        num_companies=self.env.num_companies,
-                        max_workers_per_company=self.env.max_workers_per_company
-                    )
-
-                    if assigned_worker is not None:
-                        actions[agent_name] = float(all_costs[assigned_worker])
-                    else:
-                        actions[agent_name] = 0.0
+                    actions[agent_name] = all_costs  # Full vector to environment
 
                 # Step
                 observations, rewards, terminations, truncations, infos = self.env.step(actions)
@@ -1184,26 +1089,28 @@ def main():
 
     trainer = IPPOTrainer(
         env=env,
-        lr=3e-3,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_epsilon=0.2,
-        value_coef=0.5,
-        entropy_coef=0.01,
+        # ===== TUNED HYPERPARAMETERS =====
+        lr=3e-4,              # Standard PPO range
+        gamma=0.99,           # Discount factor
+        gae_lambda=0.95,      # GAE lambda
+        clip_epsilon=0.2,     # PPO clip range
+        value_coef=0.5,       # Value loss weight
+        entropy_coef=0.0,     # DISABLED - log_std clamping provides exploration
+        # =================================
         device='cpu',
         seed=seed,
-        anneal_lr=False,
+        anneal_lr=True,       # Enable LR annealing for stability
         run_name=run_name
     )
 
-    # Train
+    # Train with more timesteps for this sparse-reward environment
     trainer.train(
-        total_timesteps=100_000,  # More timesteps for meaningful learning
-        n_steps=1024,  # Standard PPO rollout length
-        n_epochs=10,  # PPO update epochs
-        batch_size=64,  # Batch size for updates
+        total_timesteps=500_000,  # 5x more timesteps for credit assignment
+        n_steps=2048,             # Longer rollouts for better advantage estimation
+        n_epochs=10,              # PPO update epochs
+        batch_size=64,            # Batch size for updates
         log_interval=10,
-        save_interval=50000
+        save_interval=100
     )
 
     # Evaluate
