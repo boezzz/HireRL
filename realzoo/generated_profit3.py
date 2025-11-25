@@ -34,6 +34,24 @@ from typing import Optional, Tuple
 import numpy as np
 
 
+def normalize_profit_signal(p: float, method: str = "tanh", scale: float = 1.0) -> float:
+    """
+    Map raw profit to a bounded/normalized signal on ability's scale.
+
+    Args:
+        p: raw profit
+        method: "tanh" (default) or "log"
+        scale: scaling factor for tanh, ignored for log
+    """
+    if method == "tanh":
+        s = np.tanh(p / max(scale, 1e-8))
+    elif method == "log":
+        s = np.log1p(max(p, -0.999999))
+    else:
+        raise ValueError(f"Unknown profit normalization '{method}'")
+    return float(s)
+
+
 def generate_profit(
     exp_tm1: float,
     sigma_j: float,
@@ -110,6 +128,8 @@ def update_belief_from_profit(
     exp_t: float,
     delta_interview_sq: float,
     delta_eps_sq: float,
+    profit_norm_method: str = "tanh",
+    profit_norm_scale: float = 1.0,
 ) -> Tuple[float, float]:
     """
     Update a firm's private belief about a worker using realized profit.
@@ -139,7 +159,8 @@ def update_belief_from_profit(
             v_x is the weight placed on profit in the convex combination.
     """
     tilde_sigma_interview = float(tilde_sigma_interview)
-    p_ijt = float(p_ijt)
+    p_ijt_raw = float(p_ijt)
+    p_ijt = normalize_profit_signal(p_ijt_raw, method=profit_norm_method, scale=profit_norm_scale)
     exp_t = max(0.0, float(exp_t))
     delta_interview_sq = float(delta_interview_sq)
     delta_eps_sq = float(delta_eps_sq)
@@ -152,11 +173,15 @@ def update_belief_from_profit(
         K1 = 0.0
 
     if K1 > 0.0:
-        vx = (exp_t * K1) / (1.0 + (exp_t - 1.0) * K1)
+        vx_denom = 1.0 + (exp_t - 1.0) * K1
+        if abs(vx_denom) < 1e-12:
+            vx = 0.3  # fallback to avoid divide-by-zero
+        else:
+            vx = (exp_t * K1) / vx_denom
     else:
-        vx = 0.0
+        vx = 0.3  # fallback when K1 is zero
 
-    # Convex combination of interview belief and realized profit
+    # Convex combination of interview belief and normalized profit signal
     new_belief = (1.0 - vx) * tilde_sigma_interview + vx * p_ijt
 
     return float(new_belief), float(vx)

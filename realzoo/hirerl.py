@@ -377,6 +377,8 @@ class JobMarketEnv(ParallelEnv):
                     delta_interview_sq=delta_interview_sq,
                     delta_eps_sq=self.delta_eps_sq,
                     psi=self.wage_profit_share,
+                    profit_norm_method="tanh",
+                    profit_norm_scale=1.0,
                 )
 
                 phi = self._wage_multiplier(company_idx)
@@ -704,6 +706,8 @@ class JobMarketEnv(ParallelEnv):
                         exp_t=worker.experience,
                         delta_interview_sq=delta_interview_sq,
                         delta_eps_sq=self.delta_eps_sq,
+                        profit_norm_method="tanh",
+                        profit_norm_scale=1.0,
                     )
                     self.firm_beliefs[agent].belief_mean[worker_id, 0] = new_belief
                     self._last_profit[agent][worker_id] = profit

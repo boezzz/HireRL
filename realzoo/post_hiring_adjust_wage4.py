@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 import numpy as np
+from generated_profit3 import normalize_profit_signal
 
 
 @dataclass
@@ -77,6 +78,8 @@ def adjust_wage_post_hire(
     delta_eps_sq: float,
     psi: float = 0.5,
     g: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    profit_norm_method: str = "tanh",
+    profit_norm_scale: float = 1.0,
 ) -> WageAdjustmentResult:
     """
     Compute the post-hiring wage w_{j,t} based on the wage rule
@@ -120,7 +123,8 @@ def adjust_wage_post_hire(
         this base wage is computed, to avoid double-counting.
     """
     tilde_sigma_interview = float(tilde_sigma_interview)
-    p_ij_tm1 = float(p_ij_tm1)
+    p_ij_tm1_raw = float(p_ij_tm1)
+    p_ij_tm1 = normalize_profit_signal(p_ij_tm1_raw, method=profit_norm_method, scale=profit_norm_scale)
     exp_t = max(0.0, float(exp_t))
     delta_interview_sq = float(delta_interview_sq)
     delta_eps_sq = float(delta_eps_sq)
