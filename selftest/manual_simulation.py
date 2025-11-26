@@ -31,19 +31,29 @@ from real_data_init.sde import (
 )
 
 
-def choose_manual_action(action_space, action_mask, max_cost: float) -> float:
+def normalize_action_mask(action_mask, num_workers: int) -> np.ndarray:
+    """Ensure action mask is a boolean vector of length num_workers."""
+    mask_arr = np.asarray(action_mask).astype(bool).flatten()
+    if mask_arr.size != num_workers:
+        fill_val = bool(mask_arr[0]) if mask_arr.size > 0 else True
+        mask_arr = np.full(num_workers, fill_val, dtype=bool)
+    return mask_arr
+
+
+def choose_manual_action(action_space, action_mask, max_cost: float, num_workers: int) -> np.ndarray:
     """
     Select a deterministic action for debugging.
 
-    For continuous actions: pick half of the max cost (if mask allows).
-    For discrete actions: choose the highest valid index (max interview cost).
+    Outputs a cost vector (one entry per worker). Default: half max cost for
+    available workers, zero otherwise. Falls back to max for discrete.
     """
+    mask_arr = normalize_action_mask(action_mask, num_workers)
+    costs = np.zeros(num_workers, dtype=np.float32)
     if isinstance(getattr(action_space, "n", None), int):
-        valid_indices = [i for i, v in enumerate(action_mask) if v == 1]
-        return float(valid_indices[-1]) if valid_indices else 0.0
-
-    # Continuous Box action
-    return float(0.5 * max_cost if action_mask[0] == 1 else 0.0)
+        costs[mask_arr] = max_cost
+    else:
+        costs[mask_arr] = 0.5 * max_cost
+    return costs
 
 
 def print_worker_metrics(infos: Dict[str, Dict], step: int):
@@ -120,6 +130,7 @@ def run_manual_simulation():
     total_hires_per_step: List[int] = []
     total_fires_per_step: List[int] = []
     step_indices: List[int] = []
+    action_series = defaultdict(lambda: {'t': [], 'action': []})
     horizon = 100
     force_events = True  # push hires/fires early for visualization
     force_window = 20    # only force within first N steps
@@ -127,16 +138,17 @@ def run_manual_simulation():
         actions = {}
         for agent in env.agents:
             action_space = env.action_space(agent)
-            action_mask = observations[agent]["action_mask"]
+            action_mask = normalize_action_mask(observations[agent]["action_mask"], env.num_workers)
             actions[agent] = choose_manual_action(
-                action_space, action_mask, env.max_interview_cost
+                action_space, action_mask, env.max_interview_cost, env.num_workers
             )
             if force_events and step <= force_window:
                 # Force maximum interview effort to trigger matching/hiring
-                if hasattr(action_space, "n"):  # discrete
-                    actions[agent] = float(env.action_size - 1)
-                else:  # continuous
-                    actions[agent] = float(env.max_interview_cost)
+                forced = np.zeros(env.num_workers, dtype=np.float32)
+                forced[action_mask] = env.max_interview_cost
+                actions[agent] = forced
+            action_series[agent]['t'].append(step)
+            action_series[agent]['action'].append(float(np.mean(actions[agent])))
 
         observations, rewards, terminations, truncations, infos = env.step(actions)
 
@@ -170,7 +182,7 @@ def run_manual_simulation():
                         'sigma_hat': entry['sigma_hat'],
                         'sigma_tilde': entry['sigma_tilde'],
                         'wage': entry['wage'],
-                        'action_value': float(actions.get(agent)) if actions.get(agent) is not None else None,
+                        'action_value': float(actions[agent][entry['worker_id']]) if agent in actions else None,
                         'interview_cost': entry['interview_cost'],
                     })
                     if entry['interview_cost'] > 0:
@@ -224,16 +236,12 @@ def run_manual_simulation():
     print(f"\nSaved sigma/action log to {save_path}")
 
     sigma_series = defaultdict(lambda: {'t': [], 'sigma_true': [], 'sigma_hat': [], 'sigma_tilde': []})
-    action_series = defaultdict(lambda: {'t': [], 'action': []})
     for row in csv_rows:
         key = (row['agent'], row['worker_id'])
         sigma_series[key]['t'].append(row['timestep'])
         sigma_series[key]['sigma_true'].append(row['sigma_true'])
         sigma_series[key]['sigma_hat'].append(row['sigma_hat'])
         sigma_series[key]['sigma_tilde'].append(row['sigma_tilde'])
-        if row['action_value'] is not None:
-            action_series[row['agent']]['t'].append(row['timestep'])
-            action_series[row['agent']]['action'].append(row['action_value'])
 
     plot_dir = Path(__file__).with_name("manual_plots")
     plot_dir.mkdir(exist_ok=True)
