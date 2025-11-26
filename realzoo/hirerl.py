@@ -367,11 +367,11 @@ class JobMarketEnv(ParallelEnv):
             for worker_id in workforce:
                 worker = self.worker_pool.workers[worker_id]
                 last_profit = float(self._last_profit[agent][worker_id])
-                tilde_sigma = float(self._interview_signal_at_hire[agent][worker_id])
+                sigma_tilde_interview = float(self._interview_signal_at_hire[agent][worker_id])
                 delta_interview_sq = float(self._interview_vars[agent][worker_id])
 
                 result = adjust_wage_post_hire(
-                    tilde_sigma_interview=tilde_sigma,
+                    sigma_tilde_interview=sigma_tilde_interview,
                     p_ij_tm1=last_profit,
                     exp_t=worker.experience,
                     delta_interview_sq=delta_interview_sq,
@@ -682,6 +682,7 @@ class JobMarketEnv(ParallelEnv):
                     worker = self.worker_pool.workers[worker_id]
                     prev = prev_state[worker_id]
 
+                    sigma_tilde_prior = float(self.firm_beliefs[agent].belief_mean[worker_id, 0])
                     profit = generate_profit(
                         exp_tm1=prev["experience"],
                         sigma_j=prev["sigma"],
@@ -697,11 +698,11 @@ class JobMarketEnv(ParallelEnv):
                     total_profits[agent] += profit
                     total_wages[agent] += worker.wage
 
-                    tilde_sigma_interview = float(self._interview_signal_at_hire[agent][worker_id])
+                    sigma_tilde_interview = float(self._interview_signal_at_hire[agent][worker_id])
                     delta_interview_sq = float(self._interview_vars[agent][worker_id])
 
                     new_belief, vx = update_belief_from_profit(
-                        tilde_sigma_interview=tilde_sigma_interview,
+                        sigma_tilde_prior=sigma_tilde_prior,
                         p_ijt=profit,
                         exp_t=worker.experience,
                         delta_interview_sq=delta_interview_sq,

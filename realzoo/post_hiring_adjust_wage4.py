@@ -71,7 +71,7 @@ def default_g_bounded(x: np.ndarray, alpha: float = 0.5) -> np.ndarray:
 
 
 def adjust_wage_post_hire(
-    tilde_sigma_interview: float,
+    sigma_tilde_interview: float,
     p_ij_tm1: float,
     exp_t: float,
     delta_interview_sq: float,
@@ -95,7 +95,7 @@ def adjust_wage_post_hire(
 
     Args
     ----
-    tilde_sigma_interview : float
+    sigma_tilde_interview : float
         Firm i's private interview signal \tilde{\sigma}_{ij, t = interview}.
     p_ij_tm1 : float
         Realized profit p_{ij,t-1} from the previous period.
@@ -122,7 +122,7 @@ def adjust_wage_post_hire(
         (phi_type) are applied in the environment layer (JobMarketEnv) after
         this base wage is computed, to avoid double-counting.
     """
-    tilde_sigma_interview = float(tilde_sigma_interview)
+    sigma_tilde_interview = float(sigma_tilde_interview)
     p_ij_tm1_raw = float(p_ij_tm1)
     p_ij_tm1 = normalize_profit_signal(p_ij_tm1_raw, method=profit_norm_method, scale=profit_norm_scale)
     exp_t = max(0.0, float(exp_t))
@@ -154,7 +154,7 @@ def adjust_wage_post_hire(
         g = default_g_bounded
 
     # Apply g to the (scalar) interview signal
-    g_input = np.array([tilde_sigma_interview], dtype=float)
+    g_input = np.array([sigma_tilde_interview], dtype=float)
     g_val = float(g(g_input)[0])
 
     signal_component = (1.0 - vx) * g_val

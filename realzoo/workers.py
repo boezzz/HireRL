@@ -45,10 +45,15 @@ class WorkerPool:
         num_workers: int,
         ability_dim: int = 1,
         gamma: float = 0.1,         # Tenure signal growth rate
-        g0: float = 0.1,            # Base experience growth
-        g1: float = 0.05,           # Ability-dependent experience growth
+        g0: float = 0.1,            # (unused in new exp update; kept for compatibility)
+        g1: float = 0.05,           # (unused in new exp update; kept for compatibility)
         signal_noise_std: float = 0.5,  # Noise in initial public signal
-        experience_theta: float = 0.05,  # Decay parameter θ for experience accumulation
+        experience_theta: float = 0.05,  # (unused in new exp update; kept for compatibility)
+        exp_min: float = -2.0,      # Lower bound for experience
+        exp_max: float = 2.0,       # Upper bound for experience
+        eta0: float = 0.05,         # Base adjustment speed toward target
+        eta1: float = 0.02,         # Extra speed for positive ability
+        rho_unemp: float = 0.05,    # Decay rate when unemployed
         seed: Optional[int] = None
     ):
         """
@@ -70,6 +75,11 @@ class WorkerPool:
         self.g1 = g1
         self.signal_noise_std = signal_noise_std
         self.experience_theta = experience_theta
+        self.exp_min = exp_min
+        self.exp_max = exp_max
+        self.eta0 = eta0
+        self.eta1 = eta1
+        self.rho_unemp = rho_unemp
         self.rng = np.random.RandomState(seed)
 
         # Worker states
@@ -118,10 +128,12 @@ class WorkerPool:
         """
         Update worker experience and tenure at end of period.
 
-        Experience accumulation (only while employed):
-            exp_{j,t+1} = exp_{j,t}
-                + (g0 + g1 * σ_j) * 1{j employed at t} * exp(-θ * exp_{j,t}),
-            where θ = experience_theta > 0.
+        Experience:
+            - If employed: move toward target = clip(sigma_true, exp_min, exp_max)
+              via exp_{t+1} = exp_t + eta * (target - exp_t),
+              where eta = eta0 + eta1 * max(sigma_true, 0).
+            - If unemployed: decay exp_{t+1} = (1 - rho_unemp) * exp_t.
+            exp is always clipped to [exp_min, exp_max].
 
         Tenure accumulation (only while employed):
             τ_{j,t+1} = τ_{j,t} + 1{j employed at t}
@@ -131,19 +143,24 @@ class WorkerPool:
         """
         for worker in self.workers:
             if worker.employed_by >= 0:  # If employed
-                # Experience grows faster for higher ability workers with diminishing returns:
-                # exp_{j,t+1} = exp_{j,t} + (g0 + g1 * σ_j) * exp(-θ * exp_{j,t})
-                sigma_scalar = worker.sigma_true[0] if self.ability_dim == 1 else np.mean(worker.sigma_true)
-                experience_growth = (self.g0 + self.g1 * sigma_scalar) * np.exp(
-                    -self.experience_theta * max(0.0, worker.experience)
-                )
-                worker.experience += experience_growth
+                sigma_scalar = worker.sigma_true[0] if self.ability_dim == 1 else float(np.mean(worker.sigma_true))
+                target_exp = float(np.clip(sigma_scalar, self.exp_min, self.exp_max))
+                eta = float(self.eta0 + self.eta1 * max(sigma_scalar, 0.0))
+                delta = eta * (target_exp - worker.experience)
+                worker.experience = float(np.clip(worker.experience + delta, self.exp_min, self.exp_max))
 
                 # Tenure increments by 1 period
                 worker.tenure += 1
 
                 # Update public signal (employers observe tenure growth)
                 worker.sigma_hat = worker.sigma_hat_0 + self.gamma * worker.tenure
+            else:
+                # Unemployed: experience decays toward zero (or lower bound if negative)
+                worker.experience = float(np.clip(
+                    worker.experience * (1.0 - self.rho_unemp),
+                    self.exp_min,
+                    self.exp_max,
+                ))
 
     def get_unemployed_workers(self) -> List[int]:
         """

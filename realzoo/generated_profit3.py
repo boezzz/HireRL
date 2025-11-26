@@ -34,6 +34,34 @@ from typing import Optional, Tuple
 import numpy as np
 
 
+def _profit_core(
+    exp_tm1: float,
+    sigma_j: float,
+    employed_tm1: bool,
+    g0: float,
+    g1: float,
+    theta: float,
+    f_type: str,
+) -> float:
+    """
+    Deterministic component of profit without noise eps.
+    """
+    exp_tm1 = float(exp_tm1)
+    sigma_j = float(sigma_j)
+    employed_indicator = 1.0 if employed_tm1 else 0.0
+    core = exp_tm1 + (g0 + g1 * sigma_j) * employed_indicator * np.exp(-theta * exp_tm1)
+
+    if f_type == "linear":
+        val = core
+    elif f_type == "log":
+        val = np.log1p(max(core, -0.999999))
+    elif f_type == "diminishing":
+        val = core / (1.0 + 0.1 * core)
+    else:
+        raise ValueError(f"Unknown f_type '{f_type}'. Expected 'linear', 'log', or 'diminishing'.")
+    return float(val)
+
+
 def normalize_profit_signal(p: float, method: str = "tanh", scale: float = 1.0) -> float:
     """
     Map raw profit to a bounded/normalized signal on ability's scale.
@@ -97,23 +125,15 @@ def generate_profit(
     if rng is None:
         rng = np.random
 
-    exp_tm1 = float(exp_tm1)
-    sigma_j = float(sigma_j)
-
-    # Deterministic component inside f[·]
-    employed_indicator = 1.0 if employed_tm1 else 0.0
-    core = exp_tm1 + (g0 + g1 * sigma_j) * employed_indicator * np.exp(-theta * exp_tm1)
-
-    # Apply chosen f(·)
-    if f_type == "linear":
-        val = core
-    elif f_type == "log":
-        # log(1 + x) to avoid issues at x close to 0
-        val = np.log1p(max(core, -0.999999))
-    elif f_type == "diminishing":
-        val = core / (1.0 + 0.1 * core)
-    else:
-        raise ValueError(f"Unknown f_type '{f_type}'. Expected 'linear', 'log', or 'diminishing'.")
+    val = _profit_core(
+        exp_tm1=exp_tm1,
+        sigma_j=sigma_j,
+        employed_tm1=employed_tm1,
+        g0=g0,
+        g1=g1,
+        theta=theta,
+        f_type=f_type,
+    )
 
     # Add normally distributed noise eps_{ij,t}
     eps_std = float(np.sqrt(delta_eps_sq))
@@ -123,7 +143,7 @@ def generate_profit(
 
 
 def update_belief_from_profit(
-    tilde_sigma_interview: float,
+    sigma_tilde_prior: float,
     p_ijt: float,
     exp_t: float,
     delta_interview_sq: float,
@@ -146,8 +166,7 @@ def update_belief_from_profit(
         K_1 = delta_interview^2 / (delta_interview^2 + delta_eps^2).
 
     Args:
-        tilde_sigma_interview: firm's private interview signal
-            \tilde{\sigma}_{ij, t = interview}.
+        sigma_tilde_prior: firm's current belief \tilde{\sigma}_{ij,t}.
         p_ijt: realized profit p_{ij,t} observed by the firm.
         exp_t: experience exp_{j,t} used in the v_x formula.
         delta_interview_sq: interview noise variance delta_interview^2.
@@ -158,7 +177,7 @@ def update_belief_from_profit(
             new_belief = \tilde{\sigma}_{ij,t+1},
             v_x is the weight placed on profit in the convex combination.
     """
-    tilde_sigma_interview = float(tilde_sigma_interview)
+    sigma_tilde_prior = float(sigma_tilde_prior)
     p_ijt_raw = float(p_ijt)
     p_ijt = normalize_profit_signal(p_ijt_raw, method=profit_norm_method, scale=profit_norm_scale)
     exp_t = max(0.0, float(exp_t))
@@ -181,7 +200,7 @@ def update_belief_from_profit(
     else:
         vx = 0.3  # fallback when K1 is zero
 
-    # Convex combination of interview belief and normalized profit signal
-    new_belief = (1.0 - vx) * tilde_sigma_interview + vx * p_ijt
+    # Convex combination of prior belief and normalized profit signal
+    new_belief = (1.0 - vx) * sigma_tilde_prior + vx * p_ijt
 
     return float(new_belief), float(vx)
