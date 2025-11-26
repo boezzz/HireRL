@@ -30,6 +30,7 @@ class WorkerState:
     employed_by: int  # Company index or -1
     wage: float  # Current wage
     sigma_hat: np.ndarray  # Current public signal
+    ever_employed: bool = False  # Has the worker ever been employed
 
 
 class WorkerPool:
@@ -54,6 +55,11 @@ class WorkerPool:
         eta0: float = 0.05,         # Base adjustment speed toward target
         eta1: float = 0.02,         # Extra speed for positive ability
         rho_unemp: float = 0.05,    # Decay rate when unemployed
+        sigma_hat_min: float = -2.0,  # Lower bound for public signal
+        sigma_hat_max: float = 2.0,   # Upper bound for public signal
+        sigma_hat_eta0: float = 0.01, # Base growth per employed period
+        sigma_hat_eta1: float = 0.02, # Extra growth for higher initial sigma_hat0
+        sigma_hat_drop: float = 0.7,  # Multiplicative drop when fired
         seed: Optional[int] = None
     ):
         """
@@ -80,6 +86,11 @@ class WorkerPool:
         self.eta0 = eta0
         self.eta1 = eta1
         self.rho_unemp = rho_unemp
+        self.sigma_hat_min = sigma_hat_min
+        self.sigma_hat_max = sigma_hat_max
+        self.sigma_hat_eta0 = sigma_hat_eta0
+        self.sigma_hat_eta1 = sigma_hat_eta1
+        self.sigma_hat_drop = sigma_hat_drop
         self.rng = np.random.RandomState(seed)
 
         # Worker states
@@ -138,8 +149,11 @@ class WorkerPool:
         Tenure accumulation (only while employed):
             τ_{j,t+1} = τ_{j,t} + 1{j employed at t}
 
-        Public signal update (linear model):
-            σ̂_{j,t+1} = σ̂_{j,0} + γ * τ_{j,t+1}
+        Public signal:
+            - If never employed: sigma_hat stays at sigma_hat_0.
+            - If employed: sigma_hat_{t+1} = clip(sigma_hat_t + eta_sigma, [sigma_hat_min, sigma_hat_max]),
+              where eta_sigma = sigma_hat_eta0 + sigma_hat_eta1 * max(sigma_hat_0, 0).
+            - If unemployed: sigma_hat remains (post-fire drop handled in fire_worker).
         """
         for worker in self.workers:
             if worker.employed_by >= 0:  # If employed
@@ -152,8 +166,14 @@ class WorkerPool:
                 # Tenure increments by 1 period
                 worker.tenure += 1
 
-                # Update public signal (employers observe tenure growth)
-                worker.sigma_hat = worker.sigma_hat_0 + self.gamma * worker.tenure
+                # Update public signal only while employed, with growth tied to initial signal
+                eta_sigma = float(self.sigma_hat_eta0 + self.sigma_hat_eta1 * max(worker.sigma_hat_0[0], 0.0))
+                worker.sigma_hat = np.clip(
+                    worker.sigma_hat + eta_sigma,
+                    self.sigma_hat_min,
+                    self.sigma_hat_max,
+                )
+                worker.ever_employed = True
             else:
                 # Unemployed: experience decays toward zero (or lower bound if negative)
                 worker.experience = float(np.clip(
@@ -161,6 +181,7 @@ class WorkerPool:
                     self.exp_min,
                     self.exp_max,
                 ))
+                # If never employed, keep sigma_hat at initial; otherwise leave as-is (drops handled on firing)
 
     def get_unemployed_workers(self) -> List[int]:
         """
@@ -213,6 +234,12 @@ class WorkerPool:
         worker.sigma_hat = worker.sigma_hat_0 + self.gamma * worker.tenure
         # Update their "resume" signal for next employer (Per PDF: σ̂_j,0^(next) := σ̂_j,t)
         worker.sigma_hat_0 = worker.sigma_hat.copy()
+        # Apply drop to public signal when fired
+        worker.sigma_hat = np.clip(
+            worker.sigma_hat * self.sigma_hat_drop,
+            self.sigma_hat_min,
+            self.sigma_hat_max,
+        )
 
     def apply_deterministic_quit_rule(self) -> List[int]:
         """
