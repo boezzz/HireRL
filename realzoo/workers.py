@@ -48,8 +48,8 @@ class WorkerPool:
         gamma: float = 0.1,         # Tenure signal growth rate
         g0: float = 0.1,            # (unused in new exp update; kept for compatibility)
         g1: float = 0.05,           # (unused in new exp update; kept for compatibility)
-        signal_noise_std: float = 0.5,  # Noise in initial public signal
-        experience_theta: float = 0.05,  # (unused in new exp update; kept for compatibility)
+        signal_noise_std: float = 1.0,  # Larger noise in initial public signal
+        experience_theta: float = 0.2,  # steeper diminishing returns in exp update
         exp_min: float = -2.0,      # Lower bound for experience
         exp_max: float = 2.0,       # Upper bound for experience
         eta0: float = 0.05,         # Base adjustment speed toward target
@@ -140,11 +140,9 @@ class WorkerPool:
         Update worker experience and tenure at end of period.
 
         Experience:
-            - If employed: move toward target = clip(sigma_true, exp_min, exp_max)
-              via exp_{t+1} = exp_t + eta * (target - exp_t),
-              where eta = eta0 + eta1 * max(sigma_true, 0).
-            - If unemployed: decay exp_{t+1} = (1 - rho_unemp) * exp_t.
-            exp is always clipped to [exp_min, exp_max].
+            - If employed: paper-style growth
+              exp_{t+1} = exp_t + (g0 + g1 * sigma_true) * exp(-theta * exp_t)
+            - If unemployed: experience stays.
 
         Tenure accumulation (only while employed):
             τ_{j,t+1} = τ_{j,t} + 1{j employed at t}
@@ -158,10 +156,8 @@ class WorkerPool:
         for worker in self.workers:
             if worker.employed_by >= 0:  # If employed
                 sigma_scalar = worker.sigma_true[0] if self.ability_dim == 1 else float(np.mean(worker.sigma_true))
-                target_exp = float(np.clip(sigma_scalar, self.exp_min, self.exp_max))
-                eta = float(self.eta0 + self.eta1 * max(sigma_scalar, 0.0))
-                delta = eta * (target_exp - worker.experience)
-                worker.experience = float(np.clip(worker.experience + delta, self.exp_min, self.exp_max))
+                increment = (self.g0 + self.g1 * sigma_scalar) * np.exp(-self.experience_theta * worker.experience)
+                worker.experience = float(worker.experience + increment)
 
                 # Tenure increments by 1 period
                 worker.tenure += 1
@@ -175,12 +171,8 @@ class WorkerPool:
                 )
                 worker.ever_employed = True
             else:
-                # Unemployed: experience decays toward zero (or lower bound if negative)
-                worker.experience = float(np.clip(
-                    worker.experience * (1.0 - self.rho_unemp),
-                    self.exp_min,
-                    self.exp_max,
-                ))
+                # Unemployed: experience remains
+                worker.experience = float(worker.experience)
                 # If never employed, keep sigma_hat at initial; otherwise leave as-is (drops handled on firing)
 
     def get_unemployed_workers(self) -> List[int]:

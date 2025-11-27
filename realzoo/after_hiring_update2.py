@@ -177,40 +177,49 @@ class ProfitFunctionExamples:
 # ===============================================================
 # Experience Accumulation (per paper)
 # ===============================================================
-def update_experience(exp_t: float,
-                      sigma_j: float,
-                      employed_t: bool,
-                      g0: float,
-                      g1: float,
-                      theta: float) -> float:
+def update_experience(
+    exp_t: float,
+    sigma_j: float,
+    employed_t: bool,
+    g0: float,
+    g1: float,
+    theta: float,
+) -> float:
     """
-    Deterministic on-the-job experience accumulation:
-        exp_{t+1} = exp_t + (g0 + g1*sigma_j) * 1{employed at t} * exp(-theta * exp_t)
-    with exp_t >= 0 and theta > 0.
+    Experience accumulation (paper-style) without clipping or decay:
+        - If employed: exp_{t+1} = exp_t + (g0 + g1*sigma_j) * exp(-theta * exp_t)
+        - If unemployed: exp_{t+1} = exp_t
     """
-    exp_t = max(0.0, float(exp_t))
+    exp_t = float(exp_t)
     theta = float(theta)
     if theta <= 0:
         raise ValueError("theta must be > 0")
-    increment = (g0 + g1 * sigma_j) * (1.0 if employed_t else 0.0) * np.exp(-theta * exp_t)
-    return float(exp_t + increment)
+    if employed_t:
+        increment = (g0 + g1 * sigma_j) * np.exp(-theta * exp_t)
+        exp_next = exp_t + increment
+    else:
+        exp_next = exp_t
+    return float(exp_next)
 
-def update_experience_vec(exp_t: np.ndarray,
-                          sigma_j: np.ndarray,
-                          employed_t: np.ndarray,
-                          g0: float,
-                          g1: float,
-                          theta: float) -> np.ndarray:
+def update_experience_vec(
+    exp_t: np.ndarray,
+    sigma_j: np.ndarray,
+    employed_t: np.ndarray,
+    g0: float,
+    g1: float,
+    theta: float,
+) -> np.ndarray:
     """
-    Vectorized version for batch updates over workers.
+    Vectorized paper-style experience update without clipping; unemployed keep exp.
     Shapes:
       - exp_t: (N,)
       - sigma_j: (N,)
       - employed_t: (N,) boolean or {0,1}
     """
-    exp_t = np.maximum(0.0, exp_t.astype(float))
-    if theta <= 0:
-        raise ValueError("theta must be > 0")
-    employed_float = employed_t.astype(float)
-    increment = (g0 + g1 * sigma_j) * employed_float * np.exp(-theta * exp_t)
-    return (exp_t + increment).astype(float)
+    exp_t = exp_t.astype(float)
+    sigma_j = sigma_j.astype(float)
+    employed_mask = employed_t.astype(bool)
+
+    exp_next = exp_t.copy()
+    exp_next[employed_mask] = exp_t[employed_mask] + (g0 + g1 * sigma_j[employed_mask]) * np.exp(-theta * exp_t[employed_mask])
+    return exp_next.astype(float)

@@ -51,14 +51,15 @@ class JobMarketEnv(ParallelEnv):
         gamma: float = 0.1,
         g0: float = 0.1,
         g1: float = 0.05,
+        experience_theta: float = 0.2,
         base_firing_cost: float = 1.0,
         base_screening_cost: float = 0.5,
         max_interview_cost: float = 2.0,
         num_interview_cost_levels: int = 5,
         action_mode: str = "continuous",
         profit_theta: float = 0.05,
-        profit_noise_var: float = 0.4,
-        profit_function_type: str = "linear",
+        profit_noise_var: float = 0.05,
+        profit_function_type: str = "diminishing",
         wage_profit_share: float = 0.5,
         initial_offer_vx: float = 0.0,
         max_timesteps: int = 100,
@@ -173,6 +174,8 @@ class JobMarketEnv(ParallelEnv):
         self._interview_vars = _init_matrix(base_var)
         self._last_profit = _init_matrix(0.0)
         self._current_interview_costs = _init_matrix(0.0)
+        self._last_vx = _init_matrix(0.0)
+        self._last_k1 = _init_matrix(0.0)
 
         self.cost_levels = np.linspace(
             0.0,
@@ -479,6 +482,8 @@ class JobMarketEnv(ParallelEnv):
                     "sigma_tilde": float(self.firm_beliefs[agent].belief_mean[worker_id, 0]),
                     "sigma_true": float(self.worker_pool.workers[worker_id].sigma_true[0]),
                     "wage": float(self.worker_pool.workers[worker_id].wage),
+                    "vx": float(self._last_vx[agent][worker_id]),
+                    "k1": float(self._last_k1[agent][worker_id]),
                 }
             )
         return {
@@ -536,6 +541,8 @@ class JobMarketEnv(ParallelEnv):
             self._interview_vars[agent] = np.full(self.num_workers, base_var, dtype=np.float32)
             self._last_profit[agent] = np.zeros(self.num_workers, dtype=np.float32)
             self._current_interview_costs[agent] = np.zeros(self.num_workers, dtype=np.float32)
+            self._last_vx[agent] = np.zeros(self.num_workers, dtype=np.float32)
+            self._last_k1[agent] = np.zeros(self.num_workers, dtype=np.float32)
 
         # --- Assign each firm a random initial workforce drawn from the worker pool ---
         all_workers = list(range(self.num_workers))
@@ -707,10 +714,21 @@ class JobMarketEnv(ParallelEnv):
                         exp_t=worker.experience,
                         delta_interview_sq=delta_interview_sq,
                         delta_eps_sq=self.delta_eps_sq,
-                        profit_norm_method="tanh",
-                        profit_norm_scale=1.0,
+                        profit_norm_method="auto",
+                        profit_norm_scale=5.0,
+                        g0=self.g0,
+                        g1=self.g1,
+                        theta=self.profit_theta,
+                        f_type=self.profit_function_type,
                     )
                     self.firm_beliefs[agent].belief_mean[worker_id, 0] = new_belief
+                    # Store vx and k1 for diagnostics
+                    if delta_interview_sq + self.delta_eps_sq > 0:
+                        k1 = float(delta_interview_sq / (delta_interview_sq + self.delta_eps_sq))
+                    else:
+                        k1 = 0.0
+                    self._last_k1[agent][worker_id] = k1
+                    self._last_vx[agent][worker_id] = vx
                     self._last_profit[agent][worker_id] = profit
 
         if self.module_toggles["experience"]:

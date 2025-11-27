@@ -103,18 +103,17 @@ def load_realistic_env(num_firms: int = 5,
         ability_dim=1,
         action_mode="continuous",
         max_interview_cost=2.0,
-        profit_noise_var=0.0,  # disable profit noise for determinism
+        profit_noise_var=0.05,
         max_timesteps=100,
         seed=seed,
     )
-    # Make interview signals effectively deterministic by shrinking noise and seeding
-    env.screening.delta0_sq = 1e-9
+    # Use stochastic interview noise (per cost) and seeded RNG
     env.screening._rng = np.random.RandomState(seed)
     return env, firm_types
 
 
 def run_manual_simulation():
-    env, firm_types = load_realistic_env(num_firms=5, employees_per_agent=2000, random_state=42, seed=42)
+    env, firm_types = load_realistic_env(num_firms=5, employees_per_agent=4000, random_state=42, seed=42)
 
     observations, infos = env.reset(seed=42)
     print_worker_metrics(infos, step=0)
@@ -131,6 +130,7 @@ def run_manual_simulation():
     total_fires_per_step: List[int] = []
     step_indices: List[int] = []
     action_series = defaultdict(lambda: {'t': [], 'action': []})
+    vx_series = defaultdict(lambda: {'t': [], 'vx': [], 'k1': []})
     horizon = 100
     force_events = True  # push hires/fires early for visualization
     force_window = 20    # only force within first N steps
@@ -174,6 +174,14 @@ def run_manual_simulation():
             info = infos.get(agent)
             if info:
                 for entry in info.get('worker_metrics', []):
+                    # Track vx and k1 if available in info
+                    vx_val = entry.get('vx')
+                    k1_val = entry.get('k1')
+                    if vx_val is not None and k1_val is not None:
+                        key = (agent, entry['worker_id'])
+                        vx_series[key]['t'].append(step)
+                        vx_series[key]['vx'].append(vx_val)
+                        vx_series[key]['k1'].append(k1_val)
                     csv_rows.append({
                         'timestep': step,
                         'agent': agent,
@@ -184,6 +192,8 @@ def run_manual_simulation():
                         'wage': entry['wage'],
                         'action_value': float(actions[agent][entry['worker_id']]) if agent in actions else None,
                         'interview_cost': entry['interview_cost'],
+                        'vx': vx_val,
+                        'k1': k1_val,
                     })
                     if entry['interview_cost'] > 0:
                         key = (agent, entry['worker_id'])
@@ -229,7 +239,8 @@ def run_manual_simulation():
     with save_path.open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
             'timestep', 'agent', 'worker_id',
-            'sigma_true', 'sigma_hat', 'sigma_tilde', 'wage', 'action_value', 'interview_cost'
+            'sigma_true', 'sigma_hat', 'sigma_tilde', 'wage', 'action_value', 'interview_cost',
+            'vx', 'k1'
         ])
         writer.writeheader()
         writer.writerows(csv_rows)
@@ -277,6 +288,21 @@ def run_manual_simulation():
         plt.legend(uniq_handles, uniq_labels)
         plt.tight_layout()
         plt.savefig(plot_dir / f'{agent}_worker{worker_id}_sigma.png')
+        plt.close()
+
+    # Plot vx and k1 per worker if available
+    for (agent, worker_id), data in vx_series.items():
+        if not data['t']:
+            continue
+        plt.figure()
+        plt.plot(data['t'], data['vx'], label='vx')
+        plt.plot(data['t'], data['k1'], label='k1')
+        plt.xlabel('timestep')
+        plt.ylabel('value')
+        plt.title(f'{agent} worker {worker_id} vx/k1')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_dir / f'{agent}_worker{worker_id}_vx_k1.png')
         plt.close()
 
     # Finance series per firm

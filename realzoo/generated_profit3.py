@@ -80,6 +80,43 @@ def normalize_profit_signal(p: float, method: str = "tanh", scale: float = 1.0) 
     return float(s)
 
 
+def _invert_profit_to_sigma_estimate(
+    p_ijt: float,
+    exp_t: float,
+    g0: float,
+    g1: float,
+    theta: float,
+    f_type: str,
+) -> Optional[float]:
+    """
+    Attempt to back out an estimate of sigma_true from observed profit, given
+    the profit function form f_type. This is a heuristic inversion; if it fails
+    (e.g., division by zero, invalid domain), return None.
+    """
+    try:
+        # Invert f(core) to recover core estimate
+        if f_type == "linear":
+            core_est = p_ijt
+        elif f_type == "log":
+            core_est = np.expm1(p_ijt)
+        elif f_type == "diminishing":
+            denom = 1.0 - 0.1 * p_ijt
+            if abs(denom) < 1e-8:
+                return None
+            core_est = p_ijt / denom
+        else:
+            return None
+
+        if abs(g1) < 1e-8:
+            return None
+
+        # Invert core = exp_tm1 + (g0 + g1*sigma_j) * exp(-theta * exp_tm1)
+        sigma_est = ((core_est - exp_t) * np.exp(theta * exp_t) - g0) / g1
+        return float(sigma_est)
+    except Exception:
+        return None
+
+
 def generate_profit(
     exp_tm1: float,
     sigma_j: float,
@@ -148,8 +185,12 @@ def update_belief_from_profit(
     exp_t: float,
     delta_interview_sq: float,
     delta_eps_sq: float,
-    profit_norm_method: str = "tanh",
-    profit_norm_scale: float = 1.0,
+    profit_norm_method: str = "auto",
+    profit_norm_scale: float = 500.0,
+    g0: Optional[float] = None,
+    g1: Optional[float] = None,
+    theta: Optional[float] = None,
+    f_type: str = "linear",
 ) -> Tuple[float, float]:
     """
     Update a firm's private belief about a worker using realized profit.
@@ -179,11 +220,41 @@ def update_belief_from_profit(
     """
     sigma_tilde_prior = float(sigma_tilde_prior)
     p_ijt_raw = float(p_ijt)
-    p_ijt = normalize_profit_signal(p_ijt_raw, method=profit_norm_method, scale=profit_norm_scale)
     exp_t = max(0.0, float(exp_t))
     delta_interview_sq = float(delta_interview_sq)
     delta_eps_sq = float(delta_eps_sq)
 
+    # Compute profit-based signal
+    baseline: Optional[float] = None
+    if g0 is not None and g1 is not None and theta is not None:
+        try:
+            core_base = exp_t + (g0 + 0.0) * np.exp(-theta * exp_t)
+            if f_type == "linear":
+                baseline = core_base
+            elif f_type == "log":
+                baseline = np.log1p(core_base)
+            elif f_type == "diminishing":
+                baseline = core_base / (1.0 + 0.1 * core_base)
+        except Exception:
+            baseline = None
+
+    if profit_norm_method == "auto" and g0 is not None and g1 is not None and theta is not None:
+        sigma_est = _invert_profit_to_sigma_estimate(
+            p_ijt=p_ijt_raw,
+            exp_t=exp_t,
+            g0=float(g0),
+            g1=float(g1),
+            theta=float(theta),
+            f_type=f_type,
+        )
+        if sigma_est is None:
+            p_centered = p_ijt_raw - baseline if baseline is not None else p_ijt_raw
+            p_ijt = normalize_profit_signal(p_centered, method="tanh", scale=profit_norm_scale)
+        else:
+            p_ijt = sigma_est
+    else:
+        p_centered = p_ijt_raw - baseline if baseline is not None else p_ijt_raw
+        p_ijt = normalize_profit_signal(p_centered, method=profit_norm_method, scale=profit_norm_scale)
     # Compute K_1 and v_x as in the paper
     denom = delta_interview_sq + delta_eps_sq
     if denom > 0.0:
