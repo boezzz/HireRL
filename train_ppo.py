@@ -93,14 +93,12 @@ class ActorCritic(nn.Module):
         if self.action_type == "continuous":
             # Output mean cost for each worker
             self.actor_mean = layer_init(nn.Linear(hidden_dim, num_workers), std=0.01)
-            # Initialize log_std to -0.5 (std ≈ 0.6) for more focused exploration
-            # This will be clamped during forward pass to prevent runaway growth
-            self.log_std = nn.Parameter(torch.full((num_workers,), -0.5))
+            self.log_std = nn.Parameter(torch.zeros(num_workers))
         else:
             # For discrete mode: output continuous costs, then discretize
             # This is simpler than separate discrete distributions per worker
             self.actor_mean = layer_init(nn.Linear(hidden_dim, num_workers), std=0.01)
-            self.log_std = nn.Parameter(torch.full((num_workers,), -0.5))
+            self.log_std = nn.Parameter(torch.zeros(num_workers))
 
         self.critic = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
 
@@ -129,8 +127,7 @@ class ActorCritic(nn.Module):
 
         # Both continuous and discrete use same approach: output costs for all workers
         mean = self.actor_mean(features)
-        # Clamp log_std to prevent runaway growth: std in [0.3, 1.5]
-        log_std = torch.clamp(self.log_std, min=-1.2, max=0.4).expand_as(mean)
+        log_std = self.log_std.expand_as(mean)
         std = torch.exp(log_std)
         dist = Normal(mean, std)
         raw_action = mean if deterministic else dist.rsample()
@@ -183,8 +180,7 @@ class ActorCritic(nn.Module):
 
         # Treat as continuous actions for all workers
         mean = self.actor_mean(features)
-        # Clamp log_std to prevent runaway growth: std in [0.3, 1.5]
-        log_std = torch.clamp(self.log_std, min=-1.2, max=0.4).expand_as(mean)
+        log_std = self.log_std.expand_as(mean)
         std = torch.exp(log_std)
         dist = Normal(mean, std)
 
@@ -1095,7 +1091,7 @@ def main():
         gae_lambda=0.95,      # GAE lambda
         clip_epsilon=0.2,     # PPO clip range
         value_coef=0.5,       # Value loss weight
-        entropy_coef=0.0,     # DISABLED - log_std clamping provides exploration
+        entropy_coef=0.001,
         # =================================
         device='cpu',
         seed=seed,
