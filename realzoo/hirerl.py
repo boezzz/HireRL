@@ -710,6 +710,7 @@ class JobMarketEnv(ParallelEnv):
                     new_belief, vx = update_belief_from_profit(
                         sigma_tilde_interview=sigma_tilde_interview,
                         sigma_true=prev["sigma"],
+                        sigma_hat=float(worker.sigma_hat[0]),
                         exp_t=worker.experience,
                         delta_interview_sq=delta_interview_sq,
                         delta_eps_sq=self.delta_eps_sq,

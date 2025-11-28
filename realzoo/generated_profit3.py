@@ -184,6 +184,7 @@ def generate_profit(
 def update_belief_from_profit(
     sigma_tilde_interview: float,
     sigma_true: float,
+    sigma_hat: float,
     exp_t: float,
     delta_interview_sq: float,
     delta_eps_sq: float,
@@ -203,6 +204,7 @@ def update_belief_from_profit(
     """
     sigma_tilde_interview = float(sigma_tilde_interview)
     sigma_true = float(sigma_true)
+    sigma_hat = float(sigma_hat)
     exp_t = max(0.0, float(exp_t))
     delta_interview_sq = float(delta_interview_sq)
     delta_eps_sq = float(delta_eps_sq)
@@ -223,4 +225,15 @@ def update_belief_from_profit(
         vx = 0.3
 
     new_belief = (1.0 - vx) * sigma_tilde_interview + vx * sigma_true
+
+    # Enforce |sigma_tilde - sigma_true| < |sigma_hat - sigma_true|
+    d_hat = abs(sigma_hat - sigma_true)
+    d_tilde = abs(new_belief - sigma_true)
+    eps = 1e-6
+    if d_hat <= eps:
+        new_belief = sigma_true
+    elif d_tilde >= d_hat:
+        direction = 1.0 if (sigma_hat - sigma_true) >= 0 else -1.0
+        new_belief = sigma_true + direction * max(d_hat - eps, 0.0)
+
     return float(new_belief), float(vx)

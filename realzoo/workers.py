@@ -55,8 +55,8 @@ class WorkerPool:
         eta0: float = 0.05,         # Base adjustment speed toward target
         eta1: float = 0.02,         # Extra speed for positive ability
         rho_unemp: float = 0.05,    # Decay rate when unemployed
-        sigma_hat_min: float = -2.0,  # Lower bound for public signal
-        sigma_hat_max: float = 2.0,   # Upper bound for public signal
+        sigma_hat_min: float = -1.0,  # Lower bound for public signal
+        sigma_hat_max: float = 1.0,   # Upper bound for public signal
         sigma_hat_eta0: float = 0.01, # Base growth per employed period
         sigma_hat_eta1: float = 0.02, # Extra growth for higher initial sigma_hat0
         sigma_hat_drop: float = 0.7,  # Multiplicative drop when fired
@@ -120,6 +120,10 @@ class WorkerPool:
             # Create noisy public signal (resume quality doesn't perfectly reveal ability)
             noise = self.rng.randn(self.ability_dim).astype(np.float32) * self.signal_noise_std
             sigma_hat_0 = sigma_true + noise
+            # If true ability is negative, force initial public signal to be negative
+            if sigma_true[0] < 0 and sigma_hat_0[0] > 0:
+                sigma_hat_0[0] = -abs(sigma_hat_0[0])
+            sigma_hat_0 = np.clip(sigma_hat_0, self.sigma_hat_min, self.sigma_hat_max)
 
             worker = WorkerState(
                 worker_id=j,
@@ -163,7 +167,11 @@ class WorkerPool:
                 worker.tenure += 1
 
                 # Update public signal only while employed, with growth tied to initial signal
-                eta_sigma = float(self.sigma_hat_eta0 + self.sigma_hat_eta1 * max(worker.sigma_hat_0[0], 0.0))
+                # Diminishing returns as sigma_hat approaches its upper bound
+                span = max(self.sigma_hat_max - self.sigma_hat_min, 1e-6)
+                distance_to_cap = max(self.sigma_hat_max - worker.sigma_hat[0], 0.0)
+                diminish = distance_to_cap / span
+                eta_sigma = float((self.sigma_hat_eta0 + self.sigma_hat_eta1 * max(worker.sigma_hat_0[0], 0.0)) * diminish)
                 worker.sigma_hat = np.clip(
                     worker.sigma_hat + eta_sigma,
                     self.sigma_hat_min,
