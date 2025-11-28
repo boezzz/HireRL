@@ -182,82 +182,31 @@ def generate_profit(
 
 
 def update_belief_from_profit(
-    sigma_tilde_prior: float,
-    p_ijt: float,
+    sigma_tilde_interview: float,
+    sigma_true: float,
     exp_t: float,
     delta_interview_sq: float,
     delta_eps_sq: float,
-    profit_norm_method: str = "tanh",
-    profit_norm_scale: float = 5.0,
-    g0: Optional[float] = None,
-    g1: Optional[float] = None,
-    theta: Optional[float] = None,
-    f_type: str = "linear",
 ) -> Tuple[float, float]:
     """
-    Update a firm's private belief about a worker using realized profit.
+    Update a firm's private belief using interview signal and true ability.
 
-    This implements
-
+    Implements
         \tilde{\sigma}_{ij,t+1}
-        = (1 - v_x) * \tilde{\sigma}_{ij, t = interview}
-          + v_x * p_{ij,t},
-
+        = (1 - v_x) * \tilde{\sigma}_{ij, \text{interview}} + v_x * \sigma_j,
     where
-
         v_x = [exp_{j,t} * K_1] / [1 + (exp_{j,t} - 1) * K_1],
         K_1 = delta_interview^2 / (delta_interview^2 + delta_eps^2).
 
-    Args:
-        sigma_tilde_prior: firm's current belief \tilde{\sigma}_{ij,t}.
-        p_ijt: realized profit p_{ij,t} observed by the firm.
-        exp_t: experience exp_{j,t} used in the v_x formula.
-        delta_interview_sq: interview noise variance delta_interview^2.
-        delta_eps_sq: profit noise variance delta_eps^2.
-
     Returns:
-        A tuple (new_belief, v_x), where
-            new_belief = \tilde{\sigma}_{ij,t+1},
-            v_x is the weight placed on profit in the convex combination.
+        (new_belief, v_x)
     """
-    sigma_tilde_prior = float(sigma_tilde_prior)
-    p_ijt_raw = float(p_ijt)
+    sigma_tilde_interview = float(sigma_tilde_interview)
+    sigma_true = float(sigma_true)
     exp_t = max(0.0, float(exp_t))
     delta_interview_sq = float(delta_interview_sq)
     delta_eps_sq = float(delta_eps_sq)
 
-    # Compute profit-based signal (paper default: centered tanh with scale=5)
-    baseline: Optional[float] = None
-    if g0 is not None and g1 is not None and theta is not None:
-        try:
-            core_base = exp_t + (g0 + 0.0) * np.exp(-theta * exp_t)
-            if f_type == "linear":
-                baseline = core_base
-            elif f_type == "log":
-                baseline = np.log1p(core_base)
-            elif f_type == "diminishing":
-                baseline = core_base / (1.0 + 0.1 * core_base)
-        except Exception:
-            baseline = None
-
-    if profit_norm_method == "auto" and g0 is not None and g1 is not None and theta is not None:
-        sigma_est = _invert_profit_to_sigma_estimate(
-            p_ijt=p_ijt_raw,
-            exp_t=exp_t,
-            g0=float(g0),
-            g1=float(g1),
-            theta=float(theta),
-            f_type=f_type,
-        )
-        if sigma_est is None:
-            p_centered = p_ijt_raw - baseline if baseline is not None else p_ijt_raw
-            p_ijt = normalize_profit_signal(p_centered, method="tanh", scale=profit_norm_scale)
-        else:
-            p_ijt = sigma_est
-    else:
-        p_centered = p_ijt_raw - baseline if baseline is not None else p_ijt_raw
-        p_ijt = normalize_profit_signal(p_centered, method=profit_norm_method, scale=profit_norm_scale)
-    # Compute K_1 and v_x as in the paper
     denom = delta_interview_sq + delta_eps_sq
     if denom > 0.0:
         K1 = delta_interview_sq / denom
@@ -267,13 +216,11 @@ def update_belief_from_profit(
     if K1 > 0.0:
         vx_denom = 1.0 + (exp_t - 1.0) * K1
         if abs(vx_denom) < 1e-12:
-            vx = 0.3  # fallback to avoid divide-by-zero
+            vx = 0.3
         else:
             vx = (exp_t * K1) / vx_denom
     else:
-        vx = 0.3  # fallback when K1 is zero
+        vx = 0.3
 
-    # Convex combination of prior belief and normalized profit signal
-    new_belief = (1.0 - vx) * sigma_tilde_prior + vx * p_ijt
-
+    new_belief = (1.0 - vx) * sigma_tilde_interview + vx * sigma_true
     return float(new_belief), float(vx)

@@ -71,12 +71,11 @@ def print_worker_metrics(infos: Dict[str, Dict], step: int):
                 f"wage={entry['wage']:+.2f}")
 
 
-def compute_profit_signal(profit: float, scale: float = 5.0) -> float:
+def compute_profit_signal(profit: float, sigma_true: float) -> float:
     """
-    Compute s(p) = tanh(p / scale).
+    Override s(p) to equal sigma_true (for diagnostics/visualization).
     """
-    scale = max(scale, 1e-8)
-    return float(np.tanh(profit / scale))
+    return float(sigma_true)
 
 
 def load_realistic_env(num_firms: int = 5,
@@ -125,8 +124,6 @@ def run_manual_simulation():
     print_worker_metrics(infos, step=0)
     print(f"Firm types: {firm_types}")
 
-    profit_norm_scale = 5.0
-
     csv_rows: List[Dict] = []
     interview_events = defaultdict(lambda: {'t': [], 'value': []})
     firing_events = defaultdict(list)
@@ -152,7 +149,7 @@ def run_manual_simulation():
         if info:
             for entry in info.get('worker_metrics', []):
                 profit_val = entry.get('profit')
-                profit_signal = compute_profit_signal(profit=profit_val, scale=profit_norm_scale) if profit_val is not None else None
+                profit_signal = compute_profit_signal(profit=profit_val, sigma_true=entry['sigma_true'])
                 if profit_signal is not None:
                     profit_signal_series[(agent, entry['worker_id'])]['t'].append(step)
                     profit_signal_series[(agent, entry['worker_id'])]['profit_signal'].append(profit_signal)
@@ -231,7 +228,7 @@ def run_manual_simulation():
                     k1_val = entry.get('k1')
                     profit_val = entry.get('profit')
                     if profit_val is not None:
-                        profit_signal = compute_profit_signal(profit=profit_val, scale=profit_norm_scale)
+                        profit_signal = compute_profit_signal(profit=profit_val, sigma_true=entry['sigma_true'])
                         profit_signal_series[(agent, entry['worker_id'])]['t'].append(step)
                         profit_signal_series[(agent, entry['worker_id'])]['profit_signal'].append(profit_signal)
                     else:

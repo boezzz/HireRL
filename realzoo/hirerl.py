@@ -689,7 +689,6 @@ class JobMarketEnv(ParallelEnv):
                     worker = self.worker_pool.workers[worker_id]
                     prev = prev_state[worker_id]
 
-                    sigma_tilde_prior = float(self.firm_beliefs[agent].belief_mean[worker_id, 0])
                     profit = generate_profit(
                         exp_tm1=prev["experience"],
                         sigma_j=prev["sigma"],
@@ -709,17 +708,11 @@ class JobMarketEnv(ParallelEnv):
                     delta_interview_sq = float(self._interview_vars[agent][worker_id])
 
                     new_belief, vx = update_belief_from_profit(
-                        sigma_tilde_prior=sigma_tilde_prior,
-                        p_ijt=profit,
+                        sigma_tilde_interview=sigma_tilde_interview,
+                        sigma_true=prev["sigma"],
                         exp_t=worker.experience,
                         delta_interview_sq=delta_interview_sq,
                         delta_eps_sq=self.delta_eps_sq,
-                        profit_norm_method="tanh",
-                        profit_norm_scale=5.0,
-                        g0=self.g0,
-                        g1=self.g1,
-                        theta=self.profit_theta,
-                        f_type=self.profit_function_type,
                     )
                     self.firm_beliefs[agent].belief_mean[worker_id, 0] = new_belief
                     # Store vx and k1 for diagnostics
