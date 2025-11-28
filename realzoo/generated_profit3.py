@@ -110,8 +110,10 @@ def _invert_profit_to_sigma_estimate(
         if abs(g1) < 1e-8:
             return None
 
-        # Invert core = exp_tm1 + (g0 + g1*sigma_j) * exp(-theta * exp_tm1)
-        sigma_est = ((core_est - exp_t) * np.exp(theta * exp_t) - g0) / g1
+        log_term = np.log(core_est - exp_t) + theta * exp_t
+        term = np.exp(log_term)
+
+        sigma_est = (term - g0) / g1
         return float(sigma_est)
     except Exception:
         return None
