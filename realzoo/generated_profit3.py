@@ -187,8 +187,8 @@ def update_belief_from_profit(
     exp_t: float,
     delta_interview_sq: float,
     delta_eps_sq: float,
-    profit_norm_method: str = "auto",
-    profit_norm_scale: float = 500.0,
+    profit_norm_method: str = "tanh",
+    profit_norm_scale: float = 5.0,
     g0: Optional[float] = None,
     g1: Optional[float] = None,
     theta: Optional[float] = None,
@@ -226,7 +226,7 @@ def update_belief_from_profit(
     delta_interview_sq = float(delta_interview_sq)
     delta_eps_sq = float(delta_eps_sq)
 
-    # Compute profit-based signal
+    # Compute profit-based signal (paper default: centered tanh with scale=5)
     baseline: Optional[float] = None
     if g0 is not None and g1 is not None and theta is not None:
         try:

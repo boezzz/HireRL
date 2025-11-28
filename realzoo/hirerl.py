@@ -381,7 +381,7 @@ class JobMarketEnv(ParallelEnv):
                     delta_eps_sq=self.delta_eps_sq,
                     psi=self.wage_profit_share,
                     profit_norm_method="tanh",
-                    profit_norm_scale=1.0,
+                    profit_norm_scale=500,
                 )
 
                 phi = self._wage_multiplier(company_idx)
@@ -714,7 +714,7 @@ class JobMarketEnv(ParallelEnv):
                         exp_t=worker.experience,
                         delta_interview_sq=delta_interview_sq,
                         delta_eps_sq=self.delta_eps_sq,
-                        profit_norm_method="auto",
+                        profit_norm_method="tanh",
                         profit_norm_scale=5.0,
                         g0=self.g0,
                         g1=self.g1,

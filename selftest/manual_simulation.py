@@ -64,13 +64,19 @@ def print_worker_metrics(infos: Dict[str, Dict], step: int):
             continue
         print(f"\n[Step {step}] Agent {agent} worker metrics:")
         for entry in metrics:
-            print(
-                f"  worker {entry['worker_id']:>2} | "
+            print(f"  worker {entry['worker_id']:>2} | "
                 f"sigma_true={entry['sigma_true']:+.3f} | "
                 f"sigma_hat={entry['sigma_hat']:+.3f} | "
                 f"sigma_tilde={entry['sigma_tilde']:+.3f} | "
-                f"wage={entry['wage']:+.2f}"
-            )
+                f"wage={entry['wage']:+.2f}")
+
+
+def compute_profit_signal(profit: float, scale: float = 5.0) -> float:
+    """
+    Compute s(p) = tanh(p / scale).
+    """
+    scale = max(scale, 1e-8)
+    return float(np.tanh(profit / scale))
 
 
 def load_realistic_env(num_firms: int = 5,
@@ -119,6 +125,8 @@ def run_manual_simulation():
     print_worker_metrics(infos, step=0)
     print(f"Firm types: {firm_types}")
 
+    profit_norm_scale = 5.0
+
     csv_rows: List[Dict] = []
     interview_events = defaultdict(lambda: {'t': [], 'value': []})
     firing_events = defaultdict(list)
@@ -126,6 +134,8 @@ def run_manual_simulation():
     hire_counts = defaultdict(list)
     fire_counts = defaultdict(list)
     finance_series = defaultdict(lambda: {'t': [], 'profit': [], 'wage': [], 'firing_cost': [], 'reward': []})
+    wage_series = defaultdict(lambda: {'t': [], 'wage': []})
+    profit_signal_series = defaultdict(lambda: {'t': [], 'profit_signal': []})
     total_hires_per_step: List[int] = []
     total_fires_per_step: List[int] = []
     step_indices: List[int] = []
@@ -134,6 +144,46 @@ def run_manual_simulation():
     horizon = 100
     force_events = True  # push hires/fires early for visualization
     force_window = 20    # only force within first N steps
+
+    # Log reset (t=0) state so sigma_hat and sigma_tilde starting points are visible
+    step = 0
+    for agent in env.possible_agents:
+        info = infos.get(agent, {})
+        if info:
+            for entry in info.get('worker_metrics', []):
+                profit_val = entry.get('profit')
+                profit_signal = compute_profit_signal(profit=profit_val, scale=profit_norm_scale) if profit_val is not None else None
+                if profit_signal is not None:
+                    profit_signal_series[(agent, entry['worker_id'])]['t'].append(step)
+                    profit_signal_series[(agent, entry['worker_id'])]['profit_signal'].append(profit_signal)
+                vx_val = entry.get('vx')
+                k1_val = entry.get('k1')
+                if vx_val is not None and k1_val is not None:
+                    key = (agent, entry['worker_id'])
+                    vx_series[key]['t'].append(step)
+                    vx_series[key]['vx'].append(vx_val)
+                    vx_series[key]['k1'].append(k1_val)
+                csv_rows.append({
+                    'timestep': step,
+                    'agent': agent,
+                    'worker_id': entry['worker_id'],
+                    'sigma_true': entry['sigma_true'],
+                    'sigma_hat': entry['sigma_hat'],
+                    'sigma_tilde': entry['sigma_tilde'],
+                    'wage': entry['wage'],
+                    'profit': profit_val,
+                    'profit_signal': profit_signal,
+                    'action_value': None,
+                    'interview_cost': entry['interview_cost'],
+                    'vx': vx_val,
+                    'k1': k1_val,
+                })
+        hire_counts[agent].append(0)
+        fire_counts[agent].append(0)
+    total_hires_per_step.append(0)
+    total_fires_per_step.append(0)
+    step_indices.append(0)
+
     for step in range(1, horizon + 1):
         actions = {}
         for agent in env.agents:
@@ -167,6 +217,8 @@ def run_manual_simulation():
                 finance_series[agent]['wage'].append(info.get('last_step_wage', 0.0))
                 finance_series[agent]['firing_cost'].append(info.get('last_step_firing_cost', 0.0))
                 finance_series[agent]['reward'].append(info.get('last_step_reward', 0.0))
+                wage_series[agent]['t'].append(step)
+                wage_series[agent]['wage'].append(info.get('last_step_wage', 0.0))
         print_worker_metrics(infos, step=step)
         step_total_hires = 0
         step_total_fires = 0
@@ -177,6 +229,13 @@ def run_manual_simulation():
                     # Track vx and k1 if available in info
                     vx_val = entry.get('vx')
                     k1_val = entry.get('k1')
+                    profit_val = entry.get('profit')
+                    if profit_val is not None:
+                        profit_signal = compute_profit_signal(profit=profit_val, scale=profit_norm_scale)
+                        profit_signal_series[(agent, entry['worker_id'])]['t'].append(step)
+                        profit_signal_series[(agent, entry['worker_id'])]['profit_signal'].append(profit_signal)
+                    else:
+                        profit_signal = None
                     if vx_val is not None and k1_val is not None:
                         key = (agent, entry['worker_id'])
                         vx_series[key]['t'].append(step)
@@ -190,6 +249,8 @@ def run_manual_simulation():
                         'sigma_hat': entry['sigma_hat'],
                         'sigma_tilde': entry['sigma_tilde'],
                         'wage': entry['wage'],
+                        'profit': profit_val,
+                        'profit_signal': profit_signal,
                         'action_value': float(actions[agent][entry['worker_id']]) if agent in actions else None,
                         'interview_cost': entry['interview_cost'],
                         'vx': vx_val,
@@ -239,7 +300,7 @@ def run_manual_simulation():
     with save_path.open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
             'timestep', 'agent', 'worker_id',
-            'sigma_true', 'sigma_hat', 'sigma_tilde', 'wage', 'action_value', 'interview_cost',
+            'sigma_true', 'sigma_hat', 'sigma_tilde', 'wage', 'profit', 'profit_signal', 'action_value', 'interview_cost',
             'vx', 'k1'
         ])
         writer.writeheader()
@@ -305,6 +366,21 @@ def run_manual_simulation():
         plt.savefig(plot_dir / f'{agent}_worker{worker_id}_vx_k1.png')
         plt.close()
 
+    # Profit signal s(p) per worker
+    for (agent, worker_id), data in profit_signal_series.items():
+        if not data['t']:
+            continue
+        plt.figure()
+        plt.plot(data['t'], data['profit_signal'], label='s(p)')
+        plt.axhline(0.0, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
+        plt.xlabel('timestep')
+        plt.ylabel('s(p)')
+        plt.title(f'{agent} worker {worker_id} s(p)')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_dir / f'{agent}_worker{worker_id}_profit_signal.png')
+        plt.close()
+
     # Finance series per firm
     for agent, data in finance_series.items():
         if not data['t']:
@@ -320,6 +396,20 @@ def run_manual_simulation():
         plt.legend()
         plt.tight_layout()
         plt.savefig(plot_dir / f'{agent}_finance.png')
+        plt.close()
+
+    # Wage per timestep per firm
+    for agent, data in wage_series.items():
+        if not data['t']:
+            continue
+        plt.figure()
+        plt.plot(data['t'], data['wage'], label='wage')
+        plt.xlabel('timestep')
+        plt.ylabel('wage')
+        plt.title(f'{agent} wage per timestep')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_dir / f'{agent}_wage.png')
         plt.close()
 
     if step_indices:
