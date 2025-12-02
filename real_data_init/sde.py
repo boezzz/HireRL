@@ -73,6 +73,17 @@ def wage_variance_ratio(df: pd.DataFrame,
     Compute Var(wage | exp in bin_high) / Var(wage | exp in bin_low).
 
     Returns None if bins are missing or have zero variance.
+
+    • 举个简单的虚拟例子（用向下取整后的经验桶 0 和 3）：
+
+  - 桶 0（新人，exp_bin=0）：工资样本 [10k, 14k, 12k, 9k]，方差 Var_low ≈ 4.2 (千元²)。
+  - 桶 3（约 3 年经验，exp_bin=3）：工资样本 [18k, 20k, 19k, 17k]，方差 Var_high ≈ 1.0 (千元²)。
+
+  比值：
+
+  - Var_high / Var_low ≈ 1.0 / 4.2 ≈ 0.24
+
+  含义：3 年经验组的工资方差是新人组的约 24%。如果你在真实数据算出的比值是 0.24，模型就会尝试把信号噪声调到让模拟中后验方差也下降到约 24% 的水平。
     """
     stats = wage_variance_by_bin(df, exp_col=exp_col, wage_col=wage_col, max_bin=max_bin)
     bins = stats.set_index("exp_bin")
@@ -92,6 +103,12 @@ def wage_mean_by_bin(df: pd.DataFrame,
     """
     Bin wages by floor(experience) and return count/mean per bin.
     This is similar to wage_variance_by_bin but keeps only count/mean.
+      - 数据：[(0.4 年, 12k), (0.9 年, 13k), (1.2 年, 15k), (1.8 年, 14k), (3.1 年, 20k)]
+  - 按 floor 取整分桶：
+      - 桶 0：工资 [12k, 13k] → count=2, mean=12.5k
+      - 桶 1：工资 [15k, 14k] → count=2, mean=14.5k
+      - 桶 3：工资 [20k] → count=1, mean=20k
+
     """
     work = df.copy()
     work["exp_bin"] = work[exp_col].apply(lambda x: int(np.floor(x)))
@@ -128,6 +145,7 @@ def load_wage_exp_with_size(excel_path: str = None,
             return "large"
 
     df["firm_type"] = df[emp_col].apply(_firm_type_from_emp)
+    df.to_csv("/Users/joehisaishi/Library/CloudStorage/GoogleDrive-zhaijing@uw.edu/.shortcut-targets-by-id/1A8EblAG1p82E-7dXusgeL8h9ait30Ed9/Job Matching RL/load_wage_with_size.csv", index = False)
     return df
 
 
@@ -145,6 +163,22 @@ def estimate_size_wage_premia(excel_path: str = None,
 
     Returns:
         {"small": phi_small, "medium": phi_medium, "large": phi_large}
+
+          1. 先分桶并求均值
+
+  - 桶 0（exp_bin=0）：全体均值=10；small 均值=9；small 样本数=100
+  - 桶 1（exp_bin=1）：全体均值=12；small 均值=10.5；small 样本数=80
+
+  2. 每个桶的 ratio
+
+  - 桶 0：ratio = 9 / 10 = 0.90
+  - 桶 1：ratio = 10.5 / 12 ≈ 0.875
+
+  3. 用该类型在该桶的样本数做权重，求加权平均
+
+  - 加权平均 = (0.90 * 100 + 0.875 * 80) / (100 + 80) ≈ 0.888
+
+  结果：phi_small ≈ 0.888。解释：在相同经验下，小公司平均工资 ≈ 全体平均工资的 88.8%。
     """
     df = load_wage_exp_with_size(excel_path=excel_path,
                                  exp_col=exp_col,
@@ -217,15 +251,6 @@ print(f"员工数2是{emp_counts}")
 # 只保留 > 0 的值（0 或负数一般是脏数据或不想要的）
 emp_counts = emp_counts[emp_counts > 0]
 
-# （可选）去掉极端大值：例如 > 99 分位的当成 outlier
-# 这一步视你的数据情况而定，可以先打印看看分布
-upper_cap = emp_counts.quantile(0.99)
-emp_counts = emp_counts[emp_counts <= upper_cap]
-
-
-# 如果清洗完数据太少，可以打印检查
-print(f"清洗后剩余公司数量: {len(emp_counts)}")
-
 # --------------------------------------------------------
 # 3. 计算公司规模分布：分位数 + 小/中/大公司划分
 # --------------------------------------------------------
@@ -280,24 +305,32 @@ print(f"大公司代表规模: {rep_large:.1f} 员工")
 # firms_type_config 用来描述：
 #   - 每种类型在现实中大概占多少比例（prob）
 #   - 初始化时代表性规模是多少（rep_size）
+#   - samples: 该类型下清洗后的全部员工数样本，用于类型内再抽样
+small_samples = emp_counts[small_mask].to_numpy()
+medium_samples = emp_counts[medium_mask].to_numpy()
+large_samples = emp_counts[large_mask].to_numpy()
+
 firms_type_config = {
     "small": {
         "prob": p_small,
-        "rep_size": int(round(rep_small))
+        "rep_size": int(round(rep_small)),
+        "samples": small_samples
     },
     "medium": {
         "prob": p_medium,
-        "rep_size": int(round(rep_medium))
+        "rep_size": int(round(rep_medium)),
+        "samples": medium_samples
     },
     "large": {
         "prob": p_large,
-        "rep_size": int(round(rep_large))
+        "rep_size": int(round(rep_large)),
+        "samples": large_samples
     }
 }
 
 print("\n=== 初始化用公司类型配置 ===")
 for t, cfg in firms_type_config.items():
-    print(f"{t}: prob={cfg['prob']:.2%}, rep_size={cfg['rep_size']}")
+    print(f"{t}: prob={cfg['prob']:.2%}, rep_size={cfg['rep_size']}, sample_size={len(cfg['samples'])}")
 
 # --------------------------------------------------------
 # 5. 一个工具函数：根据这些配置初始化 MARL 里的公司规模
@@ -305,7 +338,8 @@ for t, cfg in firms_type_config.items():
 
 def initialize_firms(num_firms: int,
                      type_config: dict,
-                     random_state: int | None = None) -> pd.DataFrame:
+                     random_state: int | None = None,
+                     sample_strategy: str = "representative") -> pd.DataFrame:
     """
     根据现实数据估出来的公司规模分布，初始化 MARL 环境中的公司。
 
@@ -313,6 +347,7 @@ def initialize_firms(num_firms: int,
     - num_firms: 你在 MARL 里想模拟多少家公司
     - type_config: 上面生成的 firms_type_config
     - random_state: 随机种子，保证可重复性
+    - sample_strategy: "representative" 使用类型中位数，"empirical" 在该类型样本内再随机抽样
 
     返回：
     - 一个 DataFrame，每行是一家公司，包含：
@@ -320,6 +355,9 @@ def initialize_firms(num_firms: int,
         - firm_type: small / medium / large
         - init_employee_count: 初始化时的员工数量
     """
+    if sample_strategy not in {"representative", "empirical"}:
+        raise ValueError("sample_strategy must be 'representative' or 'empirical'")
+
     rng = np.random.default_rng(random_state)
 
     # 取出类型列表和对应概率，按真实占比抽样 firm_type
@@ -333,8 +371,18 @@ def initialize_firms(num_firms: int,
     sampled_types_idx = rng.choice(len(types), size=num_firms, p=probs)
     sampled_types = [types[i] for i in sampled_types_idx]
 
-    # 给每家公司一个代表性初始规模（按对应类型的 rep_size）
-    init_sizes = [type_config[t]["rep_size"] for t in sampled_types]
+    # 给每家公司一个初始规模
+    init_sizes: list[int] = []
+    for t in sampled_types:
+        if sample_strategy == "representative":
+            size = type_config[t]["rep_size"]
+        else:
+            samples = type_config[t].get("samples")
+            if samples is not None and len(samples) > 0:
+                size = float(rng.choice(samples))
+            else:
+                size = type_config[t]["rep_size"]
+        init_sizes.append(int(round(size)))
 
     # 组织成一个 DataFrame，方便后面丢给 MARL 环境
     firms_df = pd.DataFrame({
@@ -366,52 +414,70 @@ def to_env_capacities(firms_df: pd.DataFrame,
 # 7. 小仿真：校准信号/利润噪声，使后验方差下降速度贴近工资方差
 # --------------------------------------------------------
 
-def simulate_posterior_variances(delta_interview_sq: float,
-                                 delta_eps_sq: float,
+def simulate_posterior_variances(delta_interview0_sq: float,
+                                 delta_profit_sq: float,
+                                 lambda_interview: float = 0.0,
+                                 c_interview: float | np.ndarray = 0.0,
                                  g0: float = 0.1,
                                  g1: float = 0.05,
                                  theta: float = 0.05,
                                  periods: int = 4,
                                  n_workers: int = 10_000,
-                                 seed: int | None = 0) -> list[float]:
+                                 seed: int | None = 0,
+                                 profit_fn=None) -> list[float]:
     """
-    Run a lightweight Monte Carlo that mirrors the paper's belief update.
+    Run a lightweight Monte Carlo that mirrors the updated on-the-job learning setup
+    with interview noise that decays with interview cost.
 
     Returns a list of Var(tilde_sigma_t) for t=0..periods.
 
-    关键公式：
-      interview: tilde_sigma = sigma_true + N(0, delta_interview_sq)
-      profit: profit = exp_t + growth + N(0, delta_eps_sq)
-      K1 = delta_interview_sq / (delta_interview_sq + delta_eps_sq)
-      v_x = (exp_t * K1) / (1 + (exp_t - 1) * K1)
-      tilde_sigma_{t+1} = (1 - v_x) * tilde_sigma + v_x * profit
+    关键公式（与论文更新对齐）：
+      interview 信号:  tilde_sigma_interview = sigma_j + N(0, delta_interview_sq(c_interview)),
+                       其中 delta_interview_sq = delta_interview0_sq * exp(-lambda_interview * c_interview)
+      利润信号:        p_{t} = f( exp_{t-1} + (g0 + g1 * sigma_j) * 1{employed} * exp(-theta * exp_{t-1}) ) + N(0, delta_profit_sq)
+      权重:            K1 = delta_interview_sq / (delta_interview_sq + delta_profit_sq)
+                      v_t = (exp_t * K1) / (1 + (exp_t - 1) * K1)   （这里 exp_t 是更新后的经验状态，向量）
+      后验更新:         tilde_sigma_{t+1} = (1 - v_t) * tilde_sigma_interview + v_t * sigma_j
+
+    profit_fn: 可选的 f(·) 变换；默认 identity。
     """
+    profit_fn = profit_fn or (lambda x: x)
+
     rng = np.random.default_rng(seed)
     sigma_true = rng.normal(0.0, 1.0, size=n_workers)
 
-    # Interview signal
+    # Cost-sensitive interview noise: delta_interview_sq = delta_interview0_sq * exp(-lambda_interview * c_interview)
+    c_arr = np.asarray(c_interview)
+    if c_arr.shape == ():
+        c_arr = np.full(n_workers, float(c_arr))
+    delta_interview_sq = delta_interview0_sq * np.exp(-lambda_interview * c_arr)
+    delta_interview_sq = np.clip(delta_interview_sq, 1e-12, None)  # guard against numerical issues
     interview_noise = rng.normal(0.0, np.sqrt(delta_interview_sq), size=n_workers)
-    tilde_sigma = sigma_true + interview_noise
+    tilde_sigma_interview = sigma_true + interview_noise
+    tilde_sigma = tilde_sigma_interview.copy()
 
     var_history = [float(np.var(tilde_sigma))]
 
     exp_t = np.zeros(n_workers)
     for _ in range(periods):
-        # Experience growth (always employed in this toy sim)
-        growth = (g0 + g1 * sigma_true) * np.exp(-theta * exp_t)
-        exp_t_plus = exp_t + growth
+        employed = np.ones(n_workers)  # 如果需要失业/空窗，可在此处修改
+        # Experience growth uses exp_{t-1}
+        growth = (g0 + g1 * sigma_true) * employed * np.exp(-theta * exp_t)
+        exp_t_plus = exp_t + growth  # exp_t 更新后的状态
 
-        # Profit signal with noise
-        eps = rng.normal(0.0, np.sqrt(delta_eps_sq), size=n_workers)
-        profit = exp_t + growth + eps
+        # Profit signal per updated formula, with optional transform f(·)
+        eps = rng.normal(0.0, np.sqrt(delta_profit_sq), size=n_workers)
+        profit_mean = exp_t + growth
+        profit_signal = profit_fn(profit_mean) + eps  # kept for completeness; not used in posterior per new formula
 
         # Posterior update weight
-        denom = delta_interview_sq + delta_eps_sq
-        K1 = delta_interview_sq / denom if denom > 0 else 0.0
+        denom = delta_interview_sq + delta_profit_sq
+        denom = np.where(denom <= 0, np.inf, denom)
+        K1 = delta_interview_sq / denom
         vx = (exp_t_plus * K1) / (1.0 + (exp_t_plus - 1.0) * K1)
         vx = np.clip(vx, 0.0, 1.0)
 
-        tilde_sigma = (1.0 - vx) * tilde_sigma + vx * profit
+        tilde_sigma = (1.0 - vx) * tilde_sigma_interview + vx * sigma_true
         var_history.append(float(np.var(tilde_sigma)))
 
         exp_t = exp_t_plus
@@ -426,16 +492,16 @@ def calibrate_signal_noise(target_ratio: float,
                            periods: int = 6,
                            **sim_kwargs):
     """
-    Grid search (delta_interview_sq, delta_eps_sq) to match posterior variance drop.
+    Grid search (delta_interview0_sq, delta_profit_sq) to match posterior variance drop.
 
     target_ratio: if provided, match Var(t=periods)/Var(t=0) to this value.
     half_life_periods: if target_ratio is None, enforce a half-life every
         `half_life_periods` (e.g., ratio at t=3 = 0.5, t=6 = 0.25).
     periods: number of post-hire periods to simulate; default 6 to check two half-lives.
     Returns:
-        best (delta_interview_sq, delta_eps_sq, model_ratio, var_history)
+        best (delta_interview0_sq, delta_profit_sq, model_ratio, var_history)
 
-    思路：遍历 (delta_interview_sq, delta_eps_sq) 网格，跑上面的仿真，
+    思路：遍历 (delta_interview0_sq, delta_eps_sq) 网格，跑上面的仿真，
     把 Var(t)/Var(0) 与目标轨迹比较，找平均误差最小的组合。
     """
     if half_life_periods <= 0:
@@ -458,8 +524,8 @@ def calibrate_signal_noise(target_ratio: float,
     for d_int in interview_grid:
         for d_eps in eps_grid:
             vh = simulate_posterior_variances(
-                delta_interview_sq=d_int,
-                delta_eps_sq=d_eps,
+                delta_interview0_sq=d_int,
+                delta_profit_sq=d_eps,
                 periods=periods,
                 **sim_kwargs,
             )
@@ -482,7 +548,12 @@ def calibrate_signal_noise(target_ratio: float,
 
 if __name__ == "__main__":
     num_firms = 100
-    firms_init = initialize_firms(num_firms, firms_type_config, random_state=42)
+    firms_init = initialize_firms(
+        num_firms,
+        firms_type_config,
+        random_state=42,
+        sample_strategy="empirical",  # 使用类型内样本抽取初始规模
+    )
 
     print("\n=== 示例：初始化 100 家公司 ===")
     print(firms_init.head())
@@ -505,7 +576,7 @@ if __name__ == "__main__":
             if best:
                 d_int, d_eps, ratios, vh, _ = best
                 print("\n=== 建议的信号结构（贴合工资方差比例） ===")
-                print(f"delta_interview_sq ≈ {d_int}, delta_eps_sq ≈ {d_eps}")
+                print(f"delta_interview0_sq ≈ {d_int}, delta_profit_sq ≈ {d_eps}")
                 print(f"模型方差比例 Var_model(t=3)/Var(t=0): {ratios[3]:.3f}")
                 print(f"Var history: {vh}")
 
@@ -514,7 +585,7 @@ if __name__ == "__main__":
         if best_half:
             d_int, d_eps, ratios, vh, target_path = best_half
             print("\n=== 建议的信号结构（半衰期 3 年：每 3 年方差约减半） ===")
-            print(f"delta_interview_sq ≈ {d_int}, delta_eps_sq ≈ {d_eps}")
+            print(f"delta_interview0_sq ≈ {d_int}, delta_profit_sq ≈ {d_eps}")
             print("目标轨迹:", {t: round(target_path[t], 3) for t in target_path})
             print("模型轨迹:", {t: round(ratios[t], 3) for t in ratios})
             print(f"Var history: {vh}")

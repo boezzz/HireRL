@@ -263,19 +263,35 @@ class PolicyEvaluator:
                 assignments = self.env._deterministic_interview_assignments()
                 for agent_name, action_val in actions.items():
                     company_idx = int(agent_name.split("_")[1])
-                    worker_id = assignments.get(company_idx)
-                    if worker_id is None:
+                    worker_list = assignments.get(company_idx, [])
+                    if not worker_list:
                         continue
                     if getattr(self.env, "action_mode", "continuous") == "discrete":
-                        action_cost = float(self.env.cost_levels[int(action_val)])
+                        cost_vec = np.full(self.env.num_workers,
+                                           float(self.env.cost_levels[int(action_val)]),
+                                           dtype=np.float32)
                     else:
-                        action_cost = float(np.asarray(action_val).reshape(-1)[0])
-                    worker_trajectories[worker_id]['actions_received'].append({
-                        'timestep': ep_length,
-                        'company_id': company_idx,
-                        'action_type': 'interview_cost',
-                        'value': action_cost
-                    })
+                        cost_arr = np.asarray(action_val, dtype=np.float32).reshape(-1)
+                        if cost_arr.size == 0:
+                            cost_vec = np.zeros(self.env.num_workers, dtype=np.float32)
+                        elif cost_arr.size == 1:
+                            cost_vec = np.full(self.env.num_workers, float(cost_arr[0]), dtype=np.float32)
+                        else:
+                            if cost_arr.size >= self.env.num_workers:
+                                cost_vec = cost_arr[: self.env.num_workers].astype(np.float32, copy=False)
+                            else:
+                                cost_vec = np.empty(self.env.num_workers, dtype=np.float32)
+                                cost_vec[: cost_arr.size] = cost_arr
+                                cost_vec[cost_arr.size :] = cost_arr[-1]
+
+                    for worker_id in worker_list:
+                        action_cost = float(cost_vec[worker_id])
+                        worker_trajectories[worker_id]['actions_received'].append({
+                            'timestep': ep_length,
+                            'company_id': company_idx,
+                            'action_type': 'interview_cost',
+                            'value': action_cost
+                        })
 
                 # Step environment
                 next_observations, rewards, terminations, truncations, infos = self.env.step(actions)

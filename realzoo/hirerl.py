@@ -274,12 +274,12 @@ class JobMarketEnv(ParallelEnv):
         """Extract integer firm index from agent name like 'company_2'."""
         return int(agent.split("_")[1])
 
-    def _deterministic_interview_assignments(self) -> Dict[int, int]:
+    def _deterministic_interview_assignments(self) -> Dict[int, list[int]]:
         """
-        Assign each firm to the highest public-signal unemployed worker.
+        Assign each firm to one or more highest public-signal unemployed workers.
 
         Returns:
-            Mapping `firm_idx -> worker_id` for firms that receive an interview.
+            Mapping `firm_idx -> [worker_id, ...]` for firms that receive interviews.
             Only unemployed workers are considered, sorted by public signal.
         """
         public = self.worker_pool.get_public_state()
@@ -304,29 +304,32 @@ class JobMarketEnv(ParallelEnv):
             reverse=True,
         )
 
-        assignments: Dict[int, int] = {}
+        assignments: Dict[int, list[int]] = {}
         idx = 0
 
         for firm_idx in firm_order:
             current_workforce = firm_sizes[firm_idx]
-            if current_workforce >= self._capacity(firm_idx):
+            capacity_left = self._capacity(firm_idx) - current_workforce
+            if capacity_left <= 0:
                 continue
             if idx >= len(unemployed_sorted):
                 break
-            assignments[firm_idx] = unemployed_sorted[idx]
-            idx += 1
+            take = min(capacity_left, len(unemployed_sorted) - idx)
+            if take <= 0:
+                continue
+            picked = unemployed_sorted[idx : idx + take]
+            assignments[firm_idx] = picked
+            idx += take
 
         return assignments
 
     def _cost_from_action(self, action: Any) -> float:
         """
-        Map a policy action (index or float) into an interview cost scalar.
+        Map a policy action (index or float) into a single interview cost scalar.
 
         Returns:
             float cost in [action_low, action_high]; if discrete, looks up
             `cost_levels[idx]`.
-
-            no matter is discrete or cns, it returns a scalar (which is correct).
         """
         if self.action_mode == "discrete":
             idx = int(np.clip(int(action), 0, self.action_size - 1))
@@ -336,6 +339,34 @@ class JobMarketEnv(ParallelEnv):
         else:
             value = float(action)
         return float(np.clip(value, self.action_low, self.action_high))
+
+    def _cost_vector_from_action(self, action: Any) -> np.ndarray:
+        """
+        Convert an action into a per-worker cost vector.
+
+        Continuous mode: if action is array-like, it will be reshaped/broadcast
+        to length `num_workers`; if scalar, broadcast the scalar.
+        Discrete mode: lookup a scalar cost and broadcast.
+        """
+        if self.action_mode == "discrete":
+            cost = self._cost_from_action(action)
+            return np.full(self.num_workers, cost, dtype=np.float32)
+
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            cost = 0.0
+            return np.full(self.num_workers, cost, dtype=np.float32)
+        if arr.size == 1:
+            cost = float(np.clip(arr[0], self.action_low, self.action_high))
+            return np.full(self.num_workers, cost, dtype=np.float32)
+        # If longer than num_workers, truncate; if shorter, broadcast last value
+        clipped = np.clip(arr, self.action_low, self.action_high)
+        if clipped.size >= self.num_workers:
+            return clipped[: self.num_workers].astype(np.float32, copy=False)
+        out = np.empty(self.num_workers, dtype=np.float32)
+        out[: clipped.size] = clipped
+        out[clipped.size :] = clipped[-1]
+        return out
 
     def _compute_vx(self, exp_t: float, delta_interview_sq: float) -> float:
         """
@@ -392,7 +423,7 @@ class JobMarketEnv(ParallelEnv):
         Build the valid-action mask for `agent`.
 
         Returns:
-            In continuous mode: all ones of shape `(1,)`.
+            In continuous mode: all ones of shape `(action_size,)` (mask not used for vector actions).
             In discrete mode: binary vector of length `action_size` where only
             NO_OP is valid for firms without an assignment.
         """
@@ -590,10 +621,10 @@ class JobMarketEnv(ParallelEnv):
             tuple of (observations, rewards, terminations, truncations, infos),
             each a dict keyed by agent names.
         """
-        decoded_actions: Dict[str, float] = {}
+        cost_vectors: Dict[str, np.ndarray] = {}
         for agent in self.agents:
             default = 0 if self.action_mode == "discrete" else 0.0
-            decoded_actions[agent] = self._cost_from_action(actions.get(agent, default))
+            cost_vectors[agent] = self._cost_vector_from_action(actions.get(agent, default))
 
         for agent in self.agents:
             self._current_interview_costs[agent].fill(0.0)
@@ -610,7 +641,7 @@ class JobMarketEnv(ParallelEnv):
         if self.module_toggles["wage_adjustment"]:
             self._update_wages_existing_employees()
 
-        assignments: Dict[int, int] = {}
+        assignments: Dict[int, list[int]] = {}
         if self.module_toggles["interview"]:
             assignments = self._deterministic_interview_assignments()
         screening_costs = {agent: 0.0 for agent in self.agents}
@@ -624,31 +655,33 @@ class JobMarketEnv(ParallelEnv):
                 if company_idx not in assignments:
                     continue
 
-                worker_id = assignments[company_idx]
-                worker = self.worker_pool.workers[worker_id]
-                cost = decoded_actions[agent]
+                worker_list = assignments[company_idx]
+                cost_vec = cost_vectors[agent]
+                for worker_id in worker_list:
+                    worker = self.worker_pool.workers[worker_id]
+                    cost = float(cost_vec[worker_id])
 
-                screening_costs[agent] += cost
-                self._current_interview_costs[agent][worker_id] = cost
+                    screening_costs[agent] += cost
+                    self._current_interview_costs[agent][worker_id] = cost
 
-                tilde_sigma, _ = self.screening.screen_worker(
-                    sigma_true=worker.sigma_true,
-                    sigma_hat_0=worker.sigma_hat,
-                    cost=cost,
-                )
-                signal_scalar = float(tilde_sigma[0])
-                var_val = self.screening.interview_var(cost)
+                    tilde_sigma, _ = self.screening.screen_worker(
+                        sigma_true=worker.sigma_true,
+                        sigma_hat_0=worker.sigma_hat,
+                        cost=cost,
+                    )
+                    signal_scalar = float(tilde_sigma[0])
+                    var_val = self.screening.interview_var(cost)
 
-                self.firm_beliefs[agent].initialize_from_interview_signal(
-                    worker_id,
-                    signal_scalar,
-                    signal_noise_var=var_val,
-                )
-                self._interview_signal_at_hire[agent][worker_id] = signal_scalar
-                self._interview_vars[agent][worker_id] = var_val
+                    self.firm_beliefs[agent].initialize_from_interview_signal(
+                        worker_id,
+                        signal_scalar,
+                        signal_noise_var=var_val,
+                    )
+                    self._interview_signal_at_hire[agent][worker_id] = signal_scalar
+                    self._interview_vars[agent][worker_id] = var_val
 
-                tilde_matrix[company_idx, worker_id] = signal_scalar
-                targeted_workers.add(worker_id)
+                    tilde_matrix[company_idx, worker_id] = signal_scalar
+                    targeted_workers.add(worker_id)
 
         if targeted_workers and self.module_toggles["matching"]:
             phi_list = [self._wage_multiplier(idx) for idx in range(self.num_companies)]
