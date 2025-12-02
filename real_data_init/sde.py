@@ -506,8 +506,14 @@ def calibrate_signal_noise(target_ratio: float,
     """
     if half_life_periods <= 0:
         raise ValueError("half_life_periods must be positive")
-    interview_grid = interview_grid or [0.05, 0.1, 0.2, 0.4, 0.8]
-    eps_grid = eps_grid or [0.02, 0.05, 0.1, 0.2, 0.4]
+
+    # 默认搜索网格；允许调用方自定义
+    if interview_grid is None:
+        interview_grid = [0.05, 0.1, 0.2, 0.4, 0.8]
+    if eps_grid is None:
+        eps_grid = [0.02, 0.05, 0.1, 0.2, 0.4]
+    if len(interview_grid) == 0 or len(eps_grid) == 0:
+        raise ValueError("interview_grid and eps_grid must be non-empty")
 
     best = None
     best_gap = float("inf")

@@ -28,6 +28,9 @@ from real_data_init.sde import (
     initialize_firms,
     to_env_capacities,
     estimate_size_wage_premia,
+    load_wage_exp,
+    wage_variance_ratio,
+    calibrate_signal_noise,
 )
 
 
@@ -98,6 +101,21 @@ def load_realistic_env(num_firms: int = 5,
     firm_types = firms_df["firm_type"].tolist()
     premia = estimate_size_wage_premia()
 
+    # Calibrate signal noise to empirical wage variance drop if possible
+    profit_noise_var = 0.05
+    delta_interview0_sq = 0.4
+    try:
+        wage_df = load_wage_exp()
+        ratio = wage_variance_ratio(wage_df)
+        best = None if ratio is None else calibrate_signal_noise(
+            target_ratio=ratio, periods=3, n_workers=5000, seed=0
+        )
+        if best:
+            delta_interview0_sq, profit_noise_var, _, _, _ = best
+            print(f"[info] calibrated noise: delta_interview0_sq={delta_interview0_sq}, delta_profit_sq={profit_noise_var}")
+    except Exception as e:
+        print(f"[warn] noise calibration skipped ({e}); using defaults.")
+
     num_workers = sum(capacities)
     env = JobMarketEnv(
         num_companies=len(capacities), #capacities： 每家实际雇佣的人数
@@ -108,10 +126,11 @@ def load_realistic_env(num_firms: int = 5,
         ability_dim=1,
         action_mode="continuous",
         max_interview_cost=2.0,
-        profit_noise_var=0.05,
+        profit_noise_var=profit_noise_var,
         max_timesteps=100,
         seed=seed,
     )
+    env.screening.delta0_sq = float(delta_interview0_sq)
     # Use stochastic interview noise (per cost) and seeded RNG
     env.screening._rng = np.random.RandomState(seed)
     return env, firm_types

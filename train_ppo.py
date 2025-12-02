@@ -27,6 +27,12 @@ from collections import defaultdict
 from realzoo.hirerl import JobMarketEnv
 from gymnasium.spaces import Box as GymBox, Discrete as GymDiscrete
 
+# Empirical init / calibration helpers
+try:
+    from real_data_init import sde as sde_data
+except Exception:
+    sde_data = None  # fall back to synthetic defaults if unavailable
+
 
 def set_global_seed(seed: int) -> None:
     """
@@ -1158,14 +1164,76 @@ def main():
     # Ensure deterministic behavior before anything else
     set_global_seed(seed)
 
+    # --- Empirical initialization toggles ---
+    use_empirical_init = True   # set False to revert to old synthetic defaults
+    auto_calibrate_noise = True # set False to keep default noise params
+    employees_per_agent = 20_000  # scaling: real employees -> env capacity
+
+    # Defaults (synthetic)
+    num_companies = 2
+    num_workers = 10
+    firm_capacities = None
+    firm_types = None
+    firm_type_premia = None
+    profit_noise_var = 0.05
+    delta_interview0_sq = 0.4
+
+    if use_empirical_init and sde_data is not None:
+        try:
+            firms_df = sde_data.initialize_firms(
+                num_firms=num_companies,
+                type_config=sde_data.firms_type_config,
+                random_state=seed,
+                sample_strategy="empirical",
+            )
+            firm_capacities = sde_data.to_env_capacities(
+                firms_df, employees_per_agent=employees_per_agent
+            )
+            firm_types = firms_df["firm_type"].tolist()
+            firm_type_premia = sde_data.estimate_size_wage_premia()
+            num_workers = int(sum(firm_capacities))
+            num_companies = len(firm_capacities)
+            max_workers_per_company = max(firm_capacities)
+        except Exception as e:
+            print(f"[warn] empirical init failed, using synthetic defaults: {e}")
+            firm_capacities = None
+            firm_types = None
+            firm_type_premia = None
+            max_workers_per_company = 10
+    else:
+        max_workers_per_company = 10
+
+    if auto_calibrate_noise and sde_data is not None:
+        try:
+            wage_df = sde_data.load_wage_exp()
+            ratio = sde_data.wage_variance_ratio(wage_df)
+            best = None if ratio is None else sde_data.calibrate_signal_noise(
+                target_ratio=ratio, periods=3, n_workers=5000, seed=0
+            )
+            if best:
+                delta_interview0_sq, profit_noise_var, _, _, _ = best
+                print(f"[info] calibrated noise: delta_interview0_sq={delta_interview0_sq}, delta_profit_sq={profit_noise_var}")
+        except Exception as e:
+            print(f"[warn] noise calibration failed, using defaults: {e}")
+            delta_interview0_sq = 0.4
+            profit_noise_var = 0.05
+    else:
+        max_workers_per_company = max_workers_per_company if firm_capacities else 10
+
     # Create multi-agent environment with multiple companies competing
     env = JobMarketEnv(
-        num_companies=2,  # Multiple competing firms
-        num_workers=10,
-        max_workers_per_company=10,
+        num_companies=num_companies,
+        num_workers=num_workers,
+        max_workers_per_company=max_workers_per_company,
+        firm_capacities=firm_capacities,
+        firm_types=firm_types,
+        firm_type_premia=firm_type_premia,
         max_timesteps=100,  # Shorter episodes for faster learning
-        seed=seed
+        profit_noise_var=profit_noise_var,
+        seed=seed,
     )
+    # Align interview noise baseline with calibrated value
+    env.screening.delta0_sq = float(delta_interview0_sq)
 
     # Enable full dynamics: hiring, firing, production, experience
     env.set_module_toggles(
