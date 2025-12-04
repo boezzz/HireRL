@@ -46,25 +46,6 @@ class FirmBeliefs:
         self.belief_mean[worker_id, :] = mean_val
         self.belief_var[worker_id, :] = var_val
 
-    def update_from_performance(
-        self,
-        worker_id: int,
-        p_ijt: float,
-        exp_t: float,
-        tilde_sigma_interview: float,
-        delta_interview_sq: float,
-        delta_eps_sq: float,
-    ):
-        """
-        [DEPRECATED signature change in progress] Paper-consistent update.
-        This forwards to `update_from_performance_convex` to keep a single source of truth.
-        """
-        self.update_from_performance_convex(worker_id,
-                                            p_ijt=p_ijt,
-                                            tilde_sigma_interview=tilde_sigma_interview,
-                                            exp_t=exp_t,
-                                            delta_interview_sq=delta_interview_sq,
-                                            delta_eps_sq=delta_eps_sq)
 
     def get_belief(self, worker_id: int) -> Tuple[np.ndarray, np.ndarray]:
         """
