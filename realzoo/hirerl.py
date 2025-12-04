@@ -52,7 +52,7 @@ class JobMarketEnv(ParallelEnv):
         g0: float = 0.1,
         g1: float = 0.05,
         experience_theta: float = 0.2,
-        base_firing_cost: float = 1.0,
+        base_firing_cost: float = 6.0,
         base_screening_cost: float = 0.5,
         max_interview_cost: float = 2.0,
         num_interview_cost_levels: int = 5,
@@ -62,6 +62,7 @@ class JobMarketEnv(ParallelEnv):
         profit_function_type: str = "diminishing",
         wage_profit_share: float = 0.5,
         initial_offer_vx: float = 0.0,
+        wage_scale: float = 1.0,
         max_timesteps: int = 100,
         firm_types: Optional[List[str]] = None,
         firm_type_premia: Optional[Dict[str, float]] = None,
@@ -110,6 +111,7 @@ class JobMarketEnv(ParallelEnv):
 
         self.wage_profit_share = wage_profit_share
         self.initial_offer_vx = float(np.clip(initial_offer_vx, 0.0, 0.99))
+        self.wage_scale = float(wage_scale)
         self.profit_theta = profit_theta
         self.delta_eps_sq = profit_noise_var
         self.profit_function_type = profit_function_type
@@ -416,7 +418,7 @@ class JobMarketEnv(ParallelEnv):
                 )
 
                 phi = self._wage_multiplier(company_idx)
-                worker.wage = result.wage_t * phi
+                worker.wage = result.wage_t * phi * self.wage_scale
 
     def _generate_action_mask(self, agent: str) -> np.ndarray:
         """
@@ -773,7 +775,7 @@ class JobMarketEnv(ParallelEnv):
                     worker = self.worker_pool.workers[worker_id]
                     profit = float(self._last_profit[agent][worker_id])
                     wage_paid = float(worker.wage)
-                    c_fire_t = 6.0 * wage_paid
+                    c_fire_t = self.base_firing_cost * wage_paid
 
                     decision = firing_decision(
                         p_ijt=profit,

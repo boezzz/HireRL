@@ -30,6 +30,7 @@ from real_data_init.sde import (
     estimate_size_wage_premia,
     load_wage_exp,
     wage_variance_ratio,
+    wage_variance_ratio_path,
     calibrate_signal_noise,
 )
 
@@ -84,7 +85,8 @@ def compute_profit_signal(profit: float, sigma_true: float) -> float:
 def load_realistic_env(num_firms: int = 5,
                        employees_per_agent: float = 1_000.0,
                        random_state: int | None = 42,
-                       seed: int | None = 42) -> Tuple[JobMarketEnv, List[str]]:
+                       seed: int | None = 42,
+                       base_firing_cost: float = 6.0) -> Tuple[JobMarketEnv, List[str]]:
     """
     Build an env seeded by real firm sizes and wage premia.
     employees_per_agent 就是一把比例尺。公式很简单：
@@ -104,15 +106,26 @@ def load_realistic_env(num_firms: int = 5,
     # Calibrate signal noise to empirical wage variance drop if possible
     profit_noise_var = 0.05
     delta_interview0_sq = 0.4
+    wage_scale = 1.0
     try:
         wage_df = load_wage_exp()
-        ratio = wage_variance_ratio(wage_df)
-        best = None if ratio is None else calibrate_signal_noise(
-            target_ratio=ratio, periods=3, n_workers=5000, seed=0
-        )
+        # Use yearly buckets (bin_step=1) so each timestep aligns to ~1 year
+        path = wage_variance_ratio_path(wage_df, bin_step=1)
+        if path:
+            periods = max(path.keys())
+            best = calibrate_signal_noise(
+                target_path=path, periods=periods, n_workers=5000, seed=0
+            )
+        else:
+            ratio = wage_variance_ratio(wage_df)
+            best = None if ratio is None else calibrate_signal_noise(
+                target_ratio=ratio, periods=3, n_workers=5000, seed=0
+            )
         if best:
             delta_interview0_sq, profit_noise_var, _, _, _ = best
             print(f"[info] calibrated noise: delta_interview0_sq={delta_interview0_sq}, delta_profit_sq={profit_noise_var}")
+        wage_mean = float(wage_df["salary"].mean())
+        wage_scale = wage_mean if wage_mean > 0 else wage_scale
     except Exception as e:
         print(f"[warn] noise calibration skipped ({e}); using defaults.")
 
@@ -127,6 +140,8 @@ def load_realistic_env(num_firms: int = 5,
         action_mode="continuous",
         max_interview_cost=2.0,
         profit_noise_var=profit_noise_var,
+        base_firing_cost=base_firing_cost,
+        wage_scale=wage_scale,
         max_timesteps=100,
         seed=seed,
     )
@@ -151,6 +166,7 @@ def run_manual_simulation():
     fire_counts = defaultdict(list)
     finance_series = defaultdict(lambda: {'t': [], 'profit': [], 'wage': [], 'firing_cost': [], 'reward': []})
     wage_series = defaultdict(lambda: {'t': [], 'wage': []})
+    workforce_sizes = defaultdict(lambda: {'t': [], 'size': []})
     profit_signal_series = defaultdict(lambda: {'t': [], 'profit_signal': []})
     total_hires_per_step: List[int] = []
     total_fires_per_step: List[int] = []
@@ -196,6 +212,10 @@ def run_manual_simulation():
                 })
         hire_counts[agent].append(0)
         fire_counts[agent].append(0)
+        # Workforce size at t=0
+        company_idx = int(agent.split('_')[1])
+        workforce_sizes[agent]['t'].append(step)
+        workforce_sizes[agent]['size'].append(len(env.worker_pool.get_employed_by_company(company_idx)))
     total_hires_per_step.append(0)
     total_fires_per_step.append(0)
     step_indices.append(0)
@@ -307,6 +327,12 @@ def run_manual_simulation():
         total_hires_per_step.append(step_total_hires)
         total_fires_per_step.append(step_total_fires)
         step_indices.append(step)
+
+        # Workforce size after this step
+        for agent in env.possible_agents:
+            company_idx = int(agent.split('_')[1])
+            workforce_sizes[agent]['t'].append(step)
+            workforce_sizes[agent]['size'].append(len(env.worker_pool.get_employed_by_company(company_idx)))
         # Only break early if the env actually reports termination/truncation flags
         if (terminations and all(terminations.values())) or (truncations and all(truncations.values())):
             print("Episode ended early.")
@@ -414,18 +440,33 @@ def run_manual_simulation():
         plt.savefig(plot_dir / f'{agent}_finance.png')
         plt.close()
 
-    # Wage per timestep per firm
-    for agent, data in wage_series.items():
+    # Wage + firing cost per timestep per firm
+    for agent, data in finance_series.items():
         if not data['t']:
             continue
         plt.figure()
         plt.plot(data['t'], data['wage'], label='wage')
+        plt.plot(data['t'], data['firing_cost'], label='firing_cost')
         plt.xlabel('timestep')
-        plt.ylabel('wage')
-        plt.title(f'{agent} wage per timestep')
+        plt.ylabel('value')
+        plt.title(f'{agent} wage & firing cost per timestep')
         plt.legend()
         plt.tight_layout()
-        plt.savefig(plot_dir / f'{agent}_wage.png')
+        plt.savefig(plot_dir / f'{agent}_wage_and_firing_cost.png')
+        plt.close()
+
+    # Workforce size per timestep per firm
+    for agent, data in workforce_sizes.items():
+        if not data['t']:
+            continue
+        plt.figure()
+        plt.step(data['t'], data['size'], where='mid', label='workforce size')
+        plt.xlabel('timestep')
+        plt.ylabel('headcount')
+        plt.title(f'{agent} workforce size per timestep')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_dir / f'{agent}_workforce_size.png')
         plt.close()
 
     if step_indices:

@@ -96,6 +96,38 @@ def wage_variance_ratio(df: pd.DataFrame,
     return float(v_high / v_low)
 
 
+def wage_variance_ratio_path(df: pd.DataFrame,
+                             exp_col: str = "year of experience",
+                             wage_col: str = "salary",
+                             bin_step: int = 1,
+                             max_bin: int | None = None) -> dict[int, float]:
+    """
+    Compute Var(wage | exp_bin=t) / Var(wage | exp_bin=0) for t=bin_step,2*bin_step,...
+
+    Returns a dict mapping exp_bin -> ratio. Bins missing data or with nonpositive
+    variance are skipped. If bin 0 is missing or has nonpositive variance, returns {}.
+    """
+    stats = wage_variance_by_bin(df, exp_col=exp_col, wage_col=wage_col, max_bin=max_bin)
+    bins = stats.set_index("exp_bin")
+    if 0 not in bins.index:
+        return {}
+    v0 = bins.loc[0, "var"]
+    if pd.isna(v0) or v0 <= 0:
+        return {}
+    ratios: dict[int, float] = {}
+    max_t = max(bins.index)
+    if max_bin is not None:
+        max_t = min(max_t, max_bin)
+    for t in range(bin_step, max_t + 1, bin_step):
+        if t not in bins.index:
+            continue
+        vt = bins.loc[t, "var"]
+        if pd.isna(vt) or vt <= 0:
+            continue
+        ratios[t] = float(vt / v0)
+    return ratios
+
+
 def wage_mean_by_bin(df: pd.DataFrame,
                      exp_col: str = "year of experience",
                      wage_col: str = "salary",
@@ -229,6 +261,27 @@ EXCEL_PATH = "/Users/joehisaishi/Library/CloudStorage/GoogleDrive-zhaijing@uw.ed
 
 # 读入 Excel（默认读第一张表，如果你有多张表可以加 sheet_name 参数）
 df = pd.read_excel(EXCEL_PATH)
+print(df.columns)
+
+# 轻度数值化：去掉千分位/空格并转成数值，避免 agg 时字符串报错
+for _col in ["year of experience", "salary", "employee_count"]:
+    if _col in df.columns:
+        df[_col] = _coerce_numeric(df[_col], _col)
+
+stats = df.agg(
+    {
+        "year of experience": ["count", "mean", "std", "median", "max"],
+        "salary": ["count", "mean", "std", "median", "max"],
+        "employee_count": ["count", "mean", "std", "median", "max"],
+    }
+)
+
+stats = stats.T
+try:
+    stats.to_csv("/Users/joehisaishi/Library/CloudStorage/GoogleDrive-zhaijing@uw.edu/.shortcut-targets-by-id/1A8EblAG1p82E-7dXusgeL8h9ait30Ed9/Job Matching RL/summary_statistics.csv")
+except PermissionError as e:
+    print(f"[warn] could not write summary_statistics.csv: {e}")
+
 # 假设列名就是 employee_count，如果不一样这里改一下
 EMP_COL = "employee_count"
 
@@ -486,6 +539,7 @@ def simulate_posterior_variances(delta_interview0_sq: float,
 
 
 def calibrate_signal_noise(target_ratio: float,
+                           target_path: dict[int, float] | None = None,
                            half_life_periods: int = 3,
                            interview_grid: list[float] | None = None,
                            eps_grid: list[float] | None = None,
@@ -497,6 +551,7 @@ def calibrate_signal_noise(target_ratio: float,
     target_ratio: if provided, match Var(t=periods)/Var(t=0) to this value.
     half_life_periods: if target_ratio is None, enforce a half-life every
         `half_life_periods` (e.g., ratio at t=3 = 0.5, t=6 = 0.25).
+    target_path: optional dict {timestep: target_ratio_t}; overrides target_ratio/half-life.
     periods: number of post-hire periods to simulate; default 6 to check two half-lives.
     Returns:
         best (delta_interview0_sq, delta_profit_sq, model_ratio, var_history)
@@ -506,6 +561,8 @@ def calibrate_signal_noise(target_ratio: float,
     """
     if half_life_periods <= 0:
         raise ValueError("half_life_periods must be positive")
+    if target_ratio is not None and target_path is not None:
+        raise ValueError("Provide either target_ratio or target_path, not both.")
 
     # 默认搜索网格；允许调用方自定义
     if interview_grid is None:
@@ -519,7 +576,9 @@ def calibrate_signal_noise(target_ratio: float,
     best_gap = float("inf")
 
     # Build target path: either single ratio or half-life trajectory
-    if target_ratio is not None:
+    if target_path:
+        target_path = dict(target_path)  # shallow copy
+    elif target_ratio is not None:
         target_path = {periods: target_ratio}
     else:
         target_path = {

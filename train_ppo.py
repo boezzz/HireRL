@@ -1177,6 +1177,7 @@ def main():
     firm_type_premia = None
     profit_noise_var = 0.05
     delta_interview0_sq = 0.4
+    wage_scale = 1.0
 
     if use_empirical_init and sde_data is not None:
         try:
@@ -1206,13 +1207,24 @@ def main():
     if auto_calibrate_noise and sde_data is not None:
         try:
             wage_df = sde_data.load_wage_exp()
-            ratio = sde_data.wage_variance_ratio(wage_df)
-            best = None if ratio is None else sde_data.calibrate_signal_noise(
-                target_ratio=ratio, periods=3, n_workers=5000, seed=0
-            )
+            # Use yearly buckets (bin_step=1) so each timestep aligns to ~1 year
+            path = sde_data.wage_variance_ratio_path(wage_df, bin_step=1)
+            if path:
+                periods = max(path.keys())
+                best = sde_data.calibrate_signal_noise(
+                    target_path=path, periods=periods, n_workers=5000, seed=0
+                )
+            else:
+                ratio = sde_data.wage_variance_ratio(wage_df)
+                best = None if ratio is None else sde_data.calibrate_signal_noise(
+                    target_ratio=ratio, periods=3, n_workers=5000, seed=0
+                )
             if best:
                 delta_interview0_sq, profit_noise_var, _, _, _ = best
                 print(f"[info] calibrated noise: delta_interview0_sq={delta_interview0_sq}, delta_profit_sq={profit_noise_var}")
+            # Set a simple wage scale to bring model wages closer to empirical magnitude
+            wage_mean = float(wage_df["salary"].mean())
+            wage_scale = wage_mean if wage_mean > 0 else wage_scale
         except Exception as e:
             print(f"[warn] noise calibration failed, using defaults: {e}")
             delta_interview0_sq = 0.4
@@ -1230,6 +1242,7 @@ def main():
         firm_type_premia=firm_type_premia,
         max_timesteps=100,  # Shorter episodes for faster learning
         profit_noise_var=profit_noise_var,
+        wage_scale=locals().get("wage_scale", 1.0),
         seed=seed,
     )
     # Align interview noise baseline with calibrated value
