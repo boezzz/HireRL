@@ -1,14 +1,3 @@
-"""
-HireRL Parallel Environment aligned with paper timing:
-
-1. Firms deterministically target the highest public-signal workers for interviews.
-2. Agents decide how much to invest in the interview (cost -> signal precision).
-3. Wage offers for newly interviewed workers depend only on interview signals.
-4. After production, firms update beliefs from realized profits.
-5. Existing matches adjust wages using the wage rule with past profits.
-6. Deterministic firing rule: fire if p - w < -c_fire.
-"""
-
 from __future__ import annotations
 
 from typing import Dict, Tuple, Any, Optional, List
@@ -52,7 +41,7 @@ class JobMarketEnv(ParallelEnv):
         g0: float = 0.1,
         g1: float = 0.05,
         experience_theta: float = 0.2,
-        base_firing_cost: float = 6.0,
+        base_firing_cost: float = 3.0,
         base_screening_cost: float = 0.5,
         max_interview_cost: float = 2.0,
         num_interview_cost_levels: int = 5,
@@ -63,6 +52,7 @@ class JobMarketEnv(ParallelEnv):
         wage_profit_share: float = 0.5,
         initial_offer_vx: float = 0.0,
         wage_scale: float = 1.0,
+        public_signal_variance: float = 1.0,
         max_timesteps: int = 100,
         firm_types: Optional[List[str]] = None,
         firm_type_premia: Optional[Dict[str, float]] = None,
@@ -112,6 +102,7 @@ class JobMarketEnv(ParallelEnv):
         self.wage_profit_share = wage_profit_share
         self.initial_offer_vx = float(np.clip(initial_offer_vx, 0.0, 0.99))
         self.wage_scale = float(wage_scale)
+        self.public_signal_variance = float(public_signal_variance)
         self.profit_theta = profit_theta
         self.delta_eps_sq = profit_noise_var
         self.profit_function_type = profit_function_type
@@ -184,7 +175,7 @@ class JobMarketEnv(ParallelEnv):
             self.max_interview_cost,
             self.num_interview_cost_levels,
             dtype=np.float32,
-        ) #这还是discrete的。
+        )
 
         if self.action_mode == "continuous":
             self.action_low = 0.0
@@ -212,8 +203,7 @@ class JobMarketEnv(ParallelEnv):
             + num_workers  # tenure
             + num_workers  # employed_by
             + num_workers  # wages
-            + num_workers * ability_dim  # private belief,
-            + num_workers * ability_dim  # private belief variance.
+            + num_workers * ability_dim  # private belief mean
             + num_workers  # own workforce indicator
             + 1  # own profit
         )
@@ -403,11 +393,12 @@ class JobMarketEnv(ParallelEnv):
             for worker_id in workforce:
                 worker = self.worker_pool.workers[worker_id]
                 last_profit = float(self._last_profit[agent][worker_id])
-                sigma_tilde_interview = float(self._interview_signal_at_hire[agent][worker_id])
+                # Use current updated belief (per your instruction)
+                current_belief = float(self.firm_beliefs[agent].belief_mean[worker_id, 0])
                 delta_interview_sq = float(self._interview_vars[agent][worker_id])
 
                 result = adjust_wage_post_hire(
-                    sigma_tilde_interview=sigma_tilde_interview,
+                    sigma_tilde_initial=current_belief,
                     p_ij_tm1=last_profit,
                     exp_t=worker.experience,
                     delta_interview_sq=delta_interview_sq,
@@ -452,7 +443,7 @@ class JobMarketEnv(ParallelEnv):
             tenure (num_workers),
             employed_by indicators (num_workers),
             wages (num_workers),
-            belief mean/var (each num_workers * ability_dim),
+            belief mean (num_workers * ability_dim),
             own_workforce indicator (num_workers),
             recent profit (1).
         """
@@ -474,7 +465,6 @@ class JobMarketEnv(ParallelEnv):
                 public["employed_by"].astype(np.float32),  # (num_workers,)
                 public["wages"],  # (num_workers,)
                 beliefs.belief_mean.flatten(),  # (num_workers, ability_dim) -> (num_workers*ability_dim,)
-                beliefs.belief_var.flatten(),  # (num_workers, ability_dim) -> (num_workers*ability_dim,)
                 own_workforce,  # (num_workers,)
                 own_profit,  # (1,)
             ]
@@ -566,8 +556,13 @@ class JobMarketEnv(ParallelEnv):
             beliefs = FirmBeliefs(num_workers=self.num_workers, ability_dim=self.ability_dim)
             for worker_id in range(self.num_workers):
                 sigma_hat_init = public_state["sigma_hat"][worker_id]
-                init_val = float(sigma_hat_init[0])
-                beliefs.initialize_from_interview_signal(worker_id, init_val, signal_noise_var=base_var)
+                sigma_hat_val = float(sigma_hat_init[0])
+                # Initialize default beliefs based on public signals (don't mark as interviewed)
+                beliefs.initialize_default_belief(
+                    worker_id=worker_id,
+                    public_signal=sigma_hat_val,
+                    public_variance=self.public_signal_variance
+                )
             self.firm_beliefs[agent] = beliefs
             sigma_hat_flat = public_state["sigma_hat"].flatten().astype(np.float32)
             self._interview_signal_at_hire[agent] = sigma_hat_flat.copy()
@@ -671,27 +666,50 @@ class JobMarketEnv(ParallelEnv):
                         sigma_hat_0=worker.sigma_hat,
                         cost=cost,
                     )
-                    signal_scalar = float(tilde_sigma[0])
-                    var_val = self.screening.interview_var(cost)
-
+                    psi_interview = float(tilde_sigma[0])  # This is ψ_{ij,t}
+                    sigma_hat_public = float(worker.sigma_hat[0])  # This is σ̂_{j,t}
+                    
+                    # Use configured public signal variance
+                    
                     self.firm_beliefs[agent].initialize_from_interview_signal(
-                        worker_id,
-                        signal_scalar,
-                        signal_noise_var=var_val,
+                        worker_id=worker_id,
+                        psi_interview=psi_interview,
+                        sigma_hat_public=sigma_hat_public,
+                        cost=cost,
+                        delta0_sq=self.screening.delta0_sq,
+                        lambda_param=self.screening.lam,
+                        nu_hat_public=self.public_signal_variance,
                     )
-                    self._interview_signal_at_hire[agent][worker_id] = signal_scalar
-                    self._interview_vars[agent][worker_id] = var_val
-
-                    tilde_matrix[company_idx, worker_id] = signal_scalar
+                    # Store interview tracking data
+                    self._interview_signal_at_hire[agent][worker_id] = psi_interview
+                    self._interview_vars[agent][worker_id] = self.screening.interview_var(cost)
                     targeted_workers.add(worker_id)
 
-        if targeted_workers and self.module_toggles["matching"]:
+        if self.module_toggles["matching"]:
+            # Build complete belief matrix for ALL unemployed workers using effective beliefs:
+            # - Newly interviewed workers: Use fresh Bayesian beliefs (already updated above)
+            # - Previously interviewed workers: Use stored private beliefs 
+            # - Never interviewed workers: Use public signals
+            unemployed_workers = self.worker_pool.get_unemployed_workers()
+            public_state = self.worker_pool.get_public_state()
+            
+            # Populate tilde_matrix with effective beliefs for all firm-worker pairs
+            for firm_idx, agent in enumerate(self.agents):
+                for worker_id in unemployed_workers:
+                    public_signal = public_state["sigma_hat"][worker_id][0]
+                    effective_belief = self.firm_beliefs[agent].get_effective_belief(
+                        worker_id=worker_id,
+                        public_signal=public_signal,
+                        public_variance=self.public_signal_variance
+                    )
+                    tilde_matrix[firm_idx, worker_id] = effective_belief
+            
             phi_list = [self._wage_multiplier(idx) for idx in range(self.num_companies)]
             matching_result = greedy_wage_matching_from_signals(
                 tilde_sigma=tilde_matrix,
                 v_x=self.initial_offer_vx,
                 g=default_g_bounded,
-                eligible_workers=sorted(targeted_workers),
+                eligible_workers=unemployed_workers,  # All unemployed workers, not just targeted
                 firm_multipliers=phi_list,
             )
 
@@ -775,6 +793,7 @@ class JobMarketEnv(ParallelEnv):
                     worker = self.worker_pool.workers[worker_id]
                     profit = float(self._last_profit[agent][worker_id])
                     wage_paid = float(worker.wage)
+                    # Firing cost per specification: C_{i,t}^{fire} = 3 × w_{ij,t} (90-day severance)
                     c_fire_t = self.base_firing_cost * wage_paid
 
                     decision = firing_decision(
