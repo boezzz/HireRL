@@ -278,7 +278,7 @@ class WorkerPool:
 
             # Workers earning less than max quit
             for worker in group:
-                if worker.wage < max_wage - 1e-6:  # Small epsilon for numerical stability
+                if worker.wage < max_wage * 0.8:  # different frpm spec here (want more stability)
                     self.fire_worker(worker.worker_id)
                     quit_workers.append(worker.worker_id)
 

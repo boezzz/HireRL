@@ -71,7 +71,7 @@ def default_g_bounded(x: np.ndarray, alpha: float = 0.5) -> np.ndarray:
 
 
 def adjust_wage_post_hire(
-    sigma_tilde_interview: float,
+    sigma_tilde_initial: float,
     p_ij_tm1: float,
     exp_t: float,
     delta_interview_sq: float,
@@ -82,21 +82,20 @@ def adjust_wage_post_hire(
     profit_norm_scale: float = 1.0,
 ) -> WageAdjustmentResult:
     """
-    Compute the post-hiring wage w_{j,t} based on the wage rule
+    Compute the post-hiring wage using updated beliefs:
 
-        w_{j,t}
-        = (1 - v_x) g(\tilde{\sigma}_{ij, t = \text{interview}})
-          + v_x \psi \, p_{ij,t-1},
+        w_{j,t} = φ[(1-v_{j,t}) g(tilde_σ_{ij,t}) + v_{j,t} ψ p_{ij,t-1}]
 
-    where
+    where tilde_σ_{ij,t} is the current updated belief (evolves with performance),
+    and v_{j,t} increases with worker experience/tenure.
 
         v_x = [exp_{j,t} K_1] / [1 + (exp_{j,t} - 1) K_1],
         K_1 = delta_interview^2 / (delta_interview^2 + delta_eps^2).
 
     Args
     ----
-    sigma_tilde_interview : float
-        Firm i's private interview signal \tilde{\sigma}_{ij, t = interview}.
+    sigma_tilde_initial : float
+        Current updated belief tilde_σ_{ij,t} (parameter name kept for compatibility).
     p_ij_tm1 : float
         Realized profit p_{ij,t-1} from the previous period.
     exp_t : float
@@ -122,7 +121,7 @@ def adjust_wage_post_hire(
         (phi_type) are applied in the environment layer (JobMarketEnv) after
         this base wage is computed, to avoid double-counting.
     """
-    sigma_tilde_interview = float(sigma_tilde_interview)
+    sigma_tilde_initial = float(sigma_tilde_initial)
     p_ij_tm1_raw = float(p_ij_tm1)
     p_ij_tm1 = normalize_profit_signal(p_ij_tm1_raw, method=profit_norm_method, scale=profit_norm_scale)
     exp_t = max(0.0, float(exp_t))
@@ -153,8 +152,8 @@ def adjust_wage_post_hire(
     if g is None:
         g = default_g_bounded
 
-    # Apply g to the (scalar) interview signal
-    g_input = np.array([sigma_tilde_interview], dtype=float)
+    # Apply g to the (scalar) updated belief signal
+    g_input = np.array([sigma_tilde_initial], dtype=float)
     g_val = float(g(g_input)[0])
 
     signal_component = (1.0 - vx) * g_val
