@@ -106,72 +106,9 @@ class FirmBeliefs:
 
 
 # ===============================================================
-# Profit Function Definitions (Following Schönberg & Farber setup)
+# Note: generate_profit() function moved to generated_profit3.py
+# ProfitFunctionExamples class also available there as _profit_core()
 # ===============================================================
-
-def generate_profit(exp_tm1: float,
-                    sigma_j: float,
-                    employed_tm1: bool,
-                    g0: float = 0.1,
-                    g1: float = 0.5,
-                    theta: float = 0.05,
-                    delta_eps_sq: float = 0.1,
-                    f_type: str = 'linear',
-                    rng: Optional[np.random.RandomState] = None) -> float:
-    """
-    Generate realized profit p_{ij,t} following the paper's structure:
-
-        p_{ij,t} = f[ exp_{j,t-1} + (g0 + g1*sigma_j)*1{employed}*exp(-theta*exp_{j,t-1}) ] + epsilon
-
-    where epsilon ~ N(0, delta_eps_sq).
-
-    Args:
-        exp_tm1: Experience level at t-1
-        sigma_j: True ability of the worker
-        employed_tm1: Whether the worker was employed at t-1
-        g0, g1, theta: Parameters controlling experience and ability contributions
-        delta_eps_sq: Variance of performance noise ε
-        f_type: Form of profit function ('linear', 'log', 'diminishing')
-        rng: Optional RNG for reproducibility
-
-    Returns:
-        Realized profit value p_{ij,t}.
-    """
-    if rng is None:
-        rng = np.random
-
-    # Core deterministic term
-    core = exp_tm1 + (g0 + g1 * sigma_j) * (1.0 if employed_tm1 else 0.0) * np.exp(-theta * exp_tm1)
-
-    # Select profit function form f(x)
-    if f_type == 'linear':
-        val = core  # Linear production: f(x) = x
-    elif f_type == 'log':
-        val = np.log1p(core)  # Concave returns: f(x) = log(1+x)
-    elif f_type == 'diminishing':
-        val = core / (1.0 + 0.1 * core)  # Diminishing marginal returns
-    else:
-        raise ValueError(f"Unknown profit function type: {f_type}")
-
-    # Add random noise ε ~ N(0, δ_ε²)
-    eps = rng.normal(0.0, np.sqrt(delta_eps_sq))
-    return float(val + eps)
-
-
-class ProfitFunctionExamples:
-    """Convenience access to example profit functions used in calibration or testing."""
-
-    @staticmethod
-    def linear(x: float) -> float:
-        return x
-
-    @staticmethod
-    def log(x: float) -> float:
-        return np.log1p(x)
-
-    @staticmethod
-    def diminishing(x: float) -> float:
-        return x / (1.0 + 0.1 * x)
 
 
 # ===============================================================

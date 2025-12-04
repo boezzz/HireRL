@@ -255,7 +255,7 @@ class JobMarketEnv(ParallelEnv):
             return float(self.firm_type_premia.get(t, 1.0))
         return 1.0
 
-        self._observation_spaces = {agent: obs_space for agent in self.agents}
+        # self._observation_spaces = {agent: obs_space for agent in self.agents}
 
         self.timestep = 0
         self.company_profits: Dict[str, List[float]] = {agent: [] for agent in self.agents}
