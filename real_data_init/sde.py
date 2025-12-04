@@ -17,6 +17,9 @@ def _coerce_numeric(series: pd.Series, col_name: str) -> pd.Series:
     """
     Lightly clean a numeric column: strip whitespace (incl. NBSP) and commas,
     coerce to numeric, and report rows that become NaN.
+    
+    Special handling for 'year of experience': scale by 0.1 so each timestep 
+    represents 1/10 year (about 1.2 months) to match simulation timeframe.
     """
     cleaned = (
         series.astype(str)
@@ -28,6 +31,12 @@ def _coerce_numeric(series: pd.Series, col_name: str) -> pd.Series:
     bad = numeric.isna() & series.notna()
     if bad.any():
         print(f"[clean] dropped {bad.sum()} non-numeric values in '{col_name}'")
+    
+    # Scale years of experience by 0.1 to match simulation timesteps
+    if "experience" in col_name.lower():
+        numeric = numeric * 10
+        print(f"[scale] scaled '{col_name}' by 10 to match simulation timeframe")
+    
     return numeric
 # --------------------------------------------------------
 # 数据清洗 & 经验方差目标提取
