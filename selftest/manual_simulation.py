@@ -44,17 +44,20 @@ def normalize_action_mask(action_mask, action_size: int) -> np.ndarray:
     return mask_arr
 
 
-def choose_manual_action(action_space, action_mask, max_cost: float) -> float | int:
+def choose_manual_action(action_space, action_mask, max_cost: float, num_workers: int) -> np.ndarray | int:
     """
-    Select a deterministic action (single interview cost).
+    Select a deterministic action.
 
-    Continuous: half max cost if allowed; Discrete: choose highest valid index.
+    Continuous: returns vector of costs (one per worker), each set to half max cost
+    Discrete: choose highest valid index (scalar, applied to all workers by env)
     """
     mask_arr = normalize_action_mask(action_mask, getattr(action_space, "n", len(action_mask)))
     if isinstance(getattr(action_space, "n", None), int):
+        # Discrete mode: return scalar index
         valid_indices = [i for i, v in enumerate(mask_arr) if v]
         return int(valid_indices[-1]) if valid_indices else 0
-    return float(0.5 * max_cost)
+    # Continuous mode: return vector of per-worker costs
+    return np.full(num_workers, 0.5 * max_cost, dtype=np.float32)
 
 
 def print_worker_metrics(infos: Dict[str, Dict], step: int):
@@ -224,10 +227,14 @@ def run_manual_simulation():
             action_space = env.action_space(agent)
             action_mask = observations[agent]["action_mask"]
             actions[agent] = choose_manual_action(
-                action_space, action_mask, env.max_interview_cost
+                action_space, action_mask, env.max_interview_cost, env.num_workers
             )
+            # Log average interview cost (mean of non-zero costs)
+            action_vec = np.asarray(actions[agent]).reshape(-1)
+            interviewed = action_vec > 0.0
+            avg_cost = float(np.mean(action_vec[interviewed])) if interviewed.any() else 0.0
             action_series[agent]['t'].append(step)
-            action_series[agent]['action'].append(float(np.asarray(actions[agent]).reshape(-1)[0]))
+            action_series[agent]['action'].append(avg_cost)
 
         observations, rewards, terminations, truncations, infos = env.step(actions)
 
@@ -271,6 +278,13 @@ def run_manual_simulation():
                         vx_series[key]['vx'].append(vx_val)
                         vx_series[key]['k1'].append(k1_val)
                     interview_var = entry.get('interview_cost')
+                    # Extract the specific action (interview cost) for this worker
+                    action_for_worker = None
+                    if agent in actions:
+                        action_vec = np.asarray(actions[agent]).reshape(-1)
+                        worker_id = entry['worker_id']
+                        if 0 <= worker_id < len(action_vec):
+                            action_for_worker = float(action_vec[worker_id])
                     csv_rows.append({
                         'timestep': step,
                         'agent': agent,
@@ -281,7 +295,7 @@ def run_manual_simulation():
                         'wage': entry['wage'],
                         'profit': profit_val,
                         'profit_signal': profit_signal,
-                        'action_value': float(np.asarray(actions[agent]).reshape(-1)[0]) if agent in actions else None,
+                        'action_value': action_for_worker,
                         'interview_var': interview_var,
                         'vx': vx_val,
                         'k1': k1_val,

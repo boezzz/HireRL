@@ -199,80 +199,8 @@ class ActorCritic(nn.Module):
         return log_probs, value, entropy
 
 
-def compute_assigned_worker(
-    obs_dict: Dict[str, np.ndarray],
-    num_workers: int,
-    ability_dim: int,
-    company_idx: int,
-    num_companies: int,
-    max_workers_per_company: int
-) -> Optional[int]:
-    """
-    Recompute which worker this firm is assigned to interview.
-
-    Uses the same deterministic logic as the environment:
-    - Firms ordered by size (largest first)
-    - Each firm targets highest public-signal unemployed worker
-    - Workers assigned to firms in priority order
-
-    Args:
-        obs_dict: Observation dictionary containing 'observation' array
-        num_workers: Number of workers
-        ability_dim: Dimension of ability vector
-        company_idx: Index of this firm
-        num_companies: Total number of firms
-        max_workers_per_company: Maximum workforce size
-
-    Returns:
-        worker_id that this firm should interview, or None if no assignment
-    """
-    obs = obs_dict['observation'] if isinstance(obs_dict, dict) else obs_dict
-
-    # Parse observation (must match hirerl.py _get_obs format)
-    # Format: sigma_hat (N*D) + experience (N) + tenure (N) + employed_by (N) +
-    #         wages (N) + belief_mean (N*D) + belief_var (N*D) + own_workforce (N) + profit (1)
-    ptr = 0
-    sigma_hat = obs[ptr:ptr + num_workers * ability_dim].reshape(num_workers, ability_dim)
-    ptr += num_workers * ability_dim
-    experience = obs[ptr:ptr + num_workers]
-    ptr += num_workers
-    tenure = obs[ptr:ptr + num_workers]
-    ptr += num_workers
-    employed_by = obs[ptr:ptr + num_workers]
-    ptr += num_workers
-
-    # Find unemployed workers (employed_by == -1)
-    unemployed = [i for i in range(num_workers) if employed_by[i] == -1]
-    if not unemployed:
-        return None
-
-    # Sort unemployed by public signal (highest first)
-    unemployed_sorted = sorted(unemployed, key=lambda j: float(sigma_hat[j, 0]), reverse=True)
-
-    # Compute firm sizes and priority order
-    firm_sizes = {}
-    for firm_idx in range(num_companies):
-        # Count workers employed by this firm
-        firm_sizes[firm_idx] = int(np.sum(employed_by == firm_idx))
-
-    # Sort firms by size (largest first), break ties by firm index
-    firm_order = sorted(firm_sizes.keys(), key=lambda k: (-firm_sizes[k], k))
-
-    # Assign workers to firms in priority order
-    idx = 0
-    for firm_idx in firm_order:
-        current_workforce = firm_sizes[firm_idx]
-        if current_workforce >= max_workers_per_company:
-            continue
-        if idx >= len(unemployed_sorted):
-            break
-
-        if firm_idx == company_idx:
-            return unemployed_sorted[idx]
-
-        idx += 1
-
-    return None
+# Note: compute_assigned_worker function removed - no longer needed
+# The environment now accepts full action vectors (one cost per worker)
 
 
 class RolloutBuffer:
@@ -367,29 +295,21 @@ class PPOAgent:
     def get_action(
         self,
         obs_dict,
-        company_idx: int,
-        num_companies: int,
-        ability_dim: int,
-        max_workers_per_company: int,
         deterministic: bool = False
     ):
         """
         Get action for environment.
 
-        Network outputs interview costs for ALL workers, then we extract the
-        cost for the specific worker assigned to this firm.
+        Network outputs interview costs for ALL workers, and we pass the
+        full vector to the environment.
 
         Args:
             obs_dict: Observation dictionary
-            company_idx: Index of this company
-            num_companies: Total number of companies
-            ability_dim: Dimension of ability vector
-            max_workers_per_company: Max workforce size
             deterministic: Whether to use deterministic policy
 
         Returns:
-            env_action: Scalar interview cost for assigned worker
-            stored_raw: Full raw action vector (num_workers,) for training
+            env_action: Full action vector (num_workers,) of interview costs
+            stored_raw: Raw action vector (num_workers,) for training
             value: State value
             log_prob: Joint log probability over all workers
         """
@@ -407,28 +327,12 @@ class PPOAgent:
                 deterministic=deterministic,
             )
 
-        # Extract costs for all workers
+        # Extract full cost vectors
         all_costs = action.squeeze(0).cpu().numpy()  # (num_workers,)
         stored_raw = raw_action.squeeze(0).cpu().numpy()  # (num_workers,)
 
-        # Determine which worker is assigned to this firm
-        assigned_worker = compute_assigned_worker(
-            obs_dict=obs_dict,
-            num_workers=self.num_workers,
-            ability_dim=ability_dim,
-            company_idx=company_idx,
-            num_companies=num_companies,
-            max_workers_per_company=max_workers_per_company
-        )
-
-        # Extract cost for assigned worker
-        if assigned_worker is not None:
-            env_action = float(all_costs[assigned_worker])
-        else:
-            # No assignment: return zero cost (no-op)
-            env_action = 0.0
-
-        return env_action, stored_raw, value.item(), log_prob.item()
+        # Return full action vector to environment
+        return all_costs, stored_raw, value.item(), log_prob.item()
 
     def compute_gae(self, rewards, values, dones, next_value):
         """Compute Generalized Advantage Estimation."""
@@ -671,13 +575,10 @@ class IPPOTrainer:
                 'num_workers': env.num_workers,
                 'max_workers_per_company': env.max_workers_per_company,
                 'ability_dim': env.ability_dim,
-                'gamma': env.gamma,
                 'g0': env.g0,
                 'g1': env.g1,
-                'base_firing_cost': env.base_firing_cost,
-                'base_screening_cost': env.base_screening_cost,
+                'firing_cost_multiplier': env.firing_cost_multiplier,
                 'max_interview_cost': env.max_interview_cost,
-                'num_interview_cost_levels': env.num_interview_cost_levels,
                 'action_mode': env.action_mode,
                 'max_timesteps': env.max_timesteps,
             },
@@ -758,7 +659,6 @@ class IPPOTrainer:
         # Track interview cost statistics
         interview_costs = []
         all_worker_costs = {agent: [] for agent in self.env.possible_agents}  # Track costs for ALL workers
-        assigned_worker_ids = {agent: [] for agent in self.env.possible_agents}
 
         # Track environment actions (hires, fires)
         episode_hires = {agent: 0 for agent in self.env.possible_agents}
@@ -775,39 +675,29 @@ class IPPOTrainer:
 
             for agent_name in self.env.agents:
                 agent = self.agents[agent_name]
-                company_idx = int(agent_name.split('_')[1])
 
+                # Get action: full vector of interview costs for all workers
                 env_action, raw_action, value, log_prob = agent.get_action(
                     obs_dict=observations[agent_name],
-                    company_idx=company_idx,
-                    num_companies=self.env.num_companies,
-                    ability_dim=self.env.ability_dim,
-                    max_workers_per_company=self.env.max_workers_per_company,
                     deterministic=False
                 )
 
-                # Recompute assigned worker for logging
-                assigned_worker = compute_assigned_worker(
-                    obs_dict=observations[agent_name],
-                    num_workers=self.env.num_workers,
-                    ability_dim=self.env.ability_dim,
-                    company_idx=company_idx,
-                    num_companies=self.env.num_companies,
-                    max_workers_per_company=self.env.max_workers_per_company
-                )
-
-                # env_action is scalar cost for assigned worker
-                # raw_action is (num_workers,) vector of all costs
+                # env_action is (num_workers,) vector of costs
+                # raw_action is (num_workers,) vector of raw (unsquashed) costs
                 actions[agent_name] = env_action
                 values[agent_name] = value
                 log_probs[agent_name] = log_prob
                 raw_actions[agent_name] = raw_action  # Store full vector
-                interview_costs.append(env_action)
+
+                # Track interview costs (costs > 0 indicate interviews)
+                interviewed_workers = env_action > 0.0
+                num_interviewed = int(np.sum(interviewed_workers))
+                if num_interviewed > 0:
+                    avg_cost = float(np.mean(env_action[interviewed_workers]))
+                    interview_costs.append(avg_cost)
 
                 # Track full action distribution
-                all_worker_costs[agent_name].append(raw_action)  # (num_workers,) per step
-                if assigned_worker is not None:
-                    assigned_worker_ids[agent_name].append(assigned_worker)
+                all_worker_costs[agent_name].append(env_action)  # (num_workers,) per step
 
             # Step environment
             next_observations, rewards, terminations, truncations, infos = self.env.step(actions)
@@ -951,26 +841,12 @@ class IPPOTrainer:
                                 self.global_step
                             )
 
-                    # Log which workers were assigned most frequently
-                    if assigned_worker_ids[agent_name]:
-                        worker_counts = np.bincount(
-                            assigned_worker_ids[agent_name],
-                            minlength=self.env.num_workers
-                        )
-                        for worker_id in range(self.env.num_workers):
-                            self.writer.add_scalar(
-                                f"assignments/{agent_name}/worker_{worker_id}_frequency",
-                                worker_counts[worker_id],
-                                self.global_step
-                            )
-
                 # Reset environment and episode tracking
                 observations, _ = self.env.reset()
                 current_episode_rewards = {agent: 0.0 for agent in self.env.possible_agents}
                 episode_length = 0
                 interview_costs = []
                 all_worker_costs = {agent: [] for agent in self.env.possible_agents}
-                assigned_worker_ids = {agent: [] for agent in self.env.possible_agents}
                 episode_hires = {agent: 0 for agent in self.env.possible_agents}
                 episode_fires = {agent: 0 for agent in self.env.possible_agents}
                 total_hires = 0
@@ -987,6 +863,7 @@ class IPPOTrainer:
         batch_size: int = 64,
         log_interval: int = 10,
         save_interval: int = 100,
+        eval_interval: int = 0,
         save_path: Optional[str] = None,
     ):
         """
@@ -997,6 +874,10 @@ class IPPOTrainer:
         - Learning rate annealing
         - Explained variance tracking
         - Action masking
+        - Periodic evaluation with detailed metrics
+
+        Args:
+            eval_interval: Run evaluation every N updates (0 = no periodic eval)
         """
         # Create checkpoint directory
         checkpoint_dir = save_path or f"{self.run_dir}/checkpoints"
@@ -1006,6 +887,8 @@ class IPPOTrainer:
 
         print(f"\nTraining IPPO: {self.run_name}")
         print(f"Timesteps: {total_timesteps:,} | Updates: {n_updates} | Agents: {len(self.env.possible_agents)}")
+        if eval_interval > 0:
+            print(f"Evaluation interval: every {eval_interval} updates")
 
         start_time = time.time()
 
@@ -1073,6 +956,12 @@ class IPPOTrainer:
                     torch.save(self.agents[agent_name].network.state_dict(), model_path)
                 print(f"  ✓ Checkpoint saved at update {update}")
 
+            # Periodic evaluation
+            if eval_interval > 0 and update % eval_interval == 0:
+                print(f"\n--- Running evaluation at update {update} ---")
+                self.evaluate(n_episodes=5, deterministic=True)
+                print(f"--- Evaluation complete, resuming training ---\n")
+
         # Save final models
         for agent_name in self.env.possible_agents:
             model_path = os.path.join(checkpoint_dir, f"{agent_name}_final.pt")
@@ -1086,7 +975,7 @@ class IPPOTrainer:
         self.writer.close()
 
     def evaluate(self, n_episodes: int = 10, deterministic: bool = True):
-        """Evaluate learned policies."""
+        """Evaluate learned policies with time-series TensorBoard logging."""
         # Set all networks to eval mode
         for agent in self.agents.values():
             agent.network.eval()
@@ -1096,53 +985,208 @@ class IPPOTrainer:
         episode_rewards = {agent: [] for agent in self.env.possible_agents}
         episode_lengths = []
 
+        # Track time-series metrics per episode (to average across episodes later)
+        # Structure: {agent: {metric: [episode1_timeseries, episode2_timeseries, ...]}}
+        time_series_metrics = {
+            agent: {
+                'interview_costs': [],      # List of lists: each inner = per-step costs in one episode
+                'hires_per_step': [],
+                'fires_per_step': [],
+                'profits_per_step': [],
+                'wages_per_step': [],
+                'firing_costs_per_step': [],
+                'cumulative_profit': [],
+                'workforce_size': [],
+            }
+            for agent in self.env.possible_agents
+        }
+
         for episode in range(n_episodes):
             observations, _ = self.env.reset()
             ep_rewards = {agent: 0.0 for agent in self.env.possible_agents}
             ep_length = 0
+            timestep = 0
+
+            # Track metrics for THIS episode as time series
+            ep_metrics = {
+                agent: {
+                    'interview_costs': [],
+                    'hires_per_step': [],
+                    'fires_per_step': [],
+                    'profits_per_step': [],
+                    'wages_per_step': [],
+                    'firing_costs_per_step': [],
+                    'cumulative_profit': [],
+                    'workforce_size': [],
+                }
+                for agent in self.env.possible_agents
+            }
+            cumulative_profit = {agent: 0.0 for agent in self.env.possible_agents}
+
+            # Track employed_by to detect hires/fires
+            prev_employed_by = self.env.employed_by.copy()
 
             done = False
             while not done:
                 # Get actions (deterministic for evaluation)
                 actions = {}
-                for agent_name in self.env.agents:
-                    company_idx = int(agent_name.split('_')[1])
+                step_interview_costs = {}
 
-                    # Get full cost vector from network
+                for agent_name in self.env.agents:
+                    # Get full cost vector from network (returns all worker costs)
                     all_costs = self.agents[agent_name].network.get_action(
                         observations[agent_name],
                         deterministic=deterministic
                     )
+                    # Pass full action vector to environment
+                    actions[agent_name] = all_costs
 
-                    # Extract cost for assigned worker
-                    assigned_worker = compute_assigned_worker(
-                        obs_dict=observations[agent_name],
-                        num_workers=self.env.num_workers,
-                        ability_dim=self.env.ability_dim,
-                        company_idx=company_idx,
-                        num_companies=self.env.num_companies,
-                        max_workers_per_company=self.env.max_workers_per_company
-                    )
-
-                    if assigned_worker is not None:
-                        actions[agent_name] = float(all_costs[assigned_worker])
-                    else:
-                        actions[agent_name] = 0.0
+                    # Calculate interview spending (sum of costs > 0)
+                    interviewed_mask = all_costs > 0.0
+                    total_interview_cost = float(np.sum(all_costs[interviewed_mask]))
+                    step_interview_costs[agent_name] = total_interview_cost
 
                 # Step
                 observations, rewards, terminations, truncations, infos = self.env.step(actions)
 
-                # Track rewards
+                # Detect hires and fires by comparing employed_by before/after step
+                new_employed_by = self.env.employed_by.copy()
+                step_hires = {agent: 0 for agent in self.env.possible_agents}
+                step_fires = {agent: 0 for agent in self.env.possible_agents}
+
+                for worker_id in range(self.env.num_workers):
+                    prev_firm = prev_employed_by[worker_id]
+                    new_firm = new_employed_by[worker_id]
+
+                    if prev_firm < 0 and new_firm >= 0:
+                        # Worker was hired
+                        agent = f"company_{new_firm}"
+                        step_hires[agent] += 1
+                    elif prev_firm >= 0 and new_firm < 0:
+                        # Worker was fired
+                        agent = f"company_{prev_firm}"
+                        step_fires[agent] += 1
+
+                prev_employed_by = new_employed_by
+
+                # Track detailed metrics from this step
                 for agent_name in self.env.agents:
                     ep_rewards[agent_name] += rewards[agent_name]
 
+                    # Get info for this agent
+                    info = infos.get(agent_name, {})
+
+                    # Interview costs
+                    ep_metrics[agent_name]['interview_costs'].append(step_interview_costs.get(agent_name, 0.0))
+
+                    # Hires and fires (from our tracking)
+                    ep_metrics[agent_name]['hires_per_step'].append(step_hires[agent_name])
+                    ep_metrics[agent_name]['fires_per_step'].append(step_fires[agent_name])
+
+                    # Financial metrics
+                    step_profit = info.get('last_step_profit', 0.0)
+                    step_wage = info.get('last_step_wage', 0.0)
+                    step_firing_cost = info.get('last_step_firing_cost', 0.0)
+
+                    ep_metrics[agent_name]['profits_per_step'].append(step_profit)
+                    ep_metrics[agent_name]['wages_per_step'].append(step_wage)
+                    ep_metrics[agent_name]['firing_costs_per_step'].append(step_firing_cost)
+
+                    # Cumulative profit
+                    cumulative_profit[agent_name] += step_profit
+                    ep_metrics[agent_name]['cumulative_profit'].append(cumulative_profit[agent_name])
+
+                    # Workforce size
+                    company_idx = int(agent_name.split('_')[1])
+                    workforce_size = int(np.sum(self.env.employed_by == company_idx))
+                    ep_metrics[agent_name]['workforce_size'].append(workforce_size)
+
                 ep_length += 1
+                timestep += 1
                 done = all(terminations.values()) or all(truncations.values())
+
+            # Store this episode's time series
+            for agent_name in self.env.possible_agents:
+                for metric_name, values in ep_metrics[agent_name].items():
+                    time_series_metrics[agent_name][metric_name].append(values)
 
             # Store episode stats
             for agent_name in self.env.possible_agents:
                 episode_rewards[agent_name].append(ep_rewards.get(agent_name, 0.0))
             episode_lengths.append(ep_length)
+
+        # Compute mean time series across episodes and log to TensorBoard
+        eval_tag = f"eval"
+
+        for agent_name in self.env.possible_agents:
+            agent_metrics = time_series_metrics[agent_name]
+
+            # For each metric, compute mean across episodes at each timestep
+            for metric_name, episode_list in agent_metrics.items():
+                if not episode_list:
+                    continue
+
+                # episode_list is a list of lists: [episode1_timeseries, episode2_timeseries, ...]
+                # Find the minimum length (in case episodes ended at different timesteps)
+                min_length = min(len(ep_data) for ep_data in episode_list)
+
+                if min_length == 0:
+                    continue
+
+                # Compute mean across episodes for each timestep
+                mean_timeseries = []
+                for t in range(min_length):
+                    values_at_t = [ep_data[t] for ep_data in episode_list]
+                    mean_timeseries.append(np.mean(values_at_t))
+
+                # Log each timestep to TensorBoard
+                # X-axis = episode timestep (0-99), tag includes training step for differentiation
+                for t, value in enumerate(mean_timeseries):
+                    # Tag format: eval_at_step_X/agent_name/metric_name
+                    # X-axis = episode timestep
+                    self.writer.add_scalar(
+                        f"{eval_tag}_at_step_{self.global_step}/{agent_name}/{metric_name}",
+                        value,
+                        t  # Episode timestep
+                    )
+
+        # Export time-series data to CSV for offline analysis
+        csv_path = f"{self.run_dir}/eval_step_{self.global_step}_timeseries.csv"
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'episode', 'timestep', 'agent',
+                'interview_cost', 'hires', 'fires',
+                'profit', 'wage', 'firing_cost',
+                'cumulative_profit', 'workforce_size'
+            ])
+            writer.writeheader()
+
+            # Write data from each episode
+            for episode_idx in range(n_episodes):
+                for agent_name in self.env.possible_agents:
+                    metrics = time_series_metrics[agent_name]
+
+                    # Get this episode's data
+                    if episode_idx < len(metrics['interview_costs']):
+                        ep_len = len(metrics['interview_costs'][episode_idx])
+
+                        for t in range(ep_len):
+                            row = {
+                                'episode': episode_idx,
+                                'timestep': t,
+                                'agent': agent_name,
+                                'interview_cost': metrics['interview_costs'][episode_idx][t],
+                                'hires': metrics['hires_per_step'][episode_idx][t],
+                                'fires': metrics['fires_per_step'][episode_idx][t],
+                                'profit': metrics['profits_per_step'][episode_idx][t],
+                                'wage': metrics['wages_per_step'][episode_idx][t],
+                                'firing_cost': metrics['firing_costs_per_step'][episode_idx][t],
+                                'cumulative_profit': metrics['cumulative_profit'][episode_idx][t],
+                                'workforce_size': metrics['workforce_size'][episode_idx][t],
+                            }
+                            writer.writerow(row)
+
+        print(f"  Saved time-series data to: {csv_path}")
 
         # Print summary
         print(f"\nEvaluation Results:")
@@ -1150,6 +1194,21 @@ class IPPOTrainer:
             mean_reward = np.mean(episode_rewards[agent_name])
             std_reward = np.std(episode_rewards[agent_name])
             print(f"  {agent_name}: {mean_reward:.2f} ± {std_reward:.2f}")
+
+            # Print additional metrics (flatten time series for summary stats)
+            metrics = time_series_metrics[agent_name]
+            if metrics['interview_costs']:
+                all_costs = [val for ep in metrics['interview_costs'] for val in ep]
+                print(f"    Avg interview cost/step: {np.mean(all_costs):.2f}")
+            if metrics['hires_per_step']:
+                all_hires = [val for ep in metrics['hires_per_step'] for val in ep]
+                print(f"    Avg hires/step: {np.mean(all_hires):.2f}")
+            if metrics['fires_per_step']:
+                all_fires = [val for ep in metrics['fires_per_step'] for val in ep]
+                print(f"    Avg fires/step: {np.mean(all_fires):.2f}")
+            if metrics['workforce_size']:
+                all_workforce = [val for ep in metrics['workforce_size'] for val in ep]
+                print(f"    Avg workforce: {np.mean(all_workforce):.1f}")
         print(f"  Episode Length: {np.mean(episode_lengths):.1f}")
 
         # Restore networks to train mode
@@ -1170,12 +1229,12 @@ def main():
     employees_per_agent = 20_000  # scaling: real employees -> env capacity
 
     # Defaults (synthetic)
-    num_companies = 2
-    num_workers = 10
+    num_companies = 5
+    num_workers = 50
     firm_capacities = None
     firm_types = None
     firm_type_premia = None
-    profit_noise_var = 0.05
+    profit_noise_var = 0.1
     delta_interview0_sq = 0.4
     wage_scale = 1.0
 
@@ -1248,16 +1307,6 @@ def main():
     # Align interview noise baseline with calibrated value
     env.screening.delta0_sq = float(delta_interview0_sq)
 
-    # Enable full dynamics: hiring, firing, production, experience
-    env.set_module_toggles(
-        wage_adjustment=True,
-        interview=True,
-        matching=True,
-        production=True,  # Generate profits
-        experience=True,  # Workers accumulate experience
-        firing=True,  # Allow firing decisions
-    )
-
     # Create trainer with unique run name
     import datetime
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1284,10 +1333,11 @@ def main():
         n_epochs=10,  # PPO update epochs
         batch_size=64,  # Batch size for updates
         log_interval=10,
-        save_interval=50000
+        save_interval=50000,
+        eval_interval=10  # Evaluate every 10 updates to track learning progress
     )
 
-    # Evaluate
+    # Final evaluation - single episode to see clean temporal behavior
     trainer.evaluate(n_episodes=10, deterministic=True)
 
 

@@ -32,10 +32,10 @@ def _coerce_numeric(series: pd.Series, col_name: str) -> pd.Series:
     if bad.any():
         print(f"[clean] dropped {bad.sum()} non-numeric values in '{col_name}'")
     
-    # Scale years of experience by 0.1 to match simulation timesteps
+    # Scale years of experience by 12 to match simulation timesteps
     if "experience" in col_name.lower():
-        numeric = numeric * 10
-        print(f"[scale] scaled '{col_name}' by 10 to match simulation timeframe")
+        numeric = numeric * 12
+        print(f"[scale] scaled '{col_name}' by 12 to match simulation timeframe")
     
     return numeric
 # --------------------------------------------------------

@@ -9,7 +9,7 @@ from pettingzoo.utils.env import ParallelEnv
 from interview0 import ScreeningMechanism
 from matching1 import greedy_wage_matching_from_signals, WageMatchingResult
 from generated_profit2 import generate_profit_array, update_beliefs_and_experience
-from post_hiring_adjust_wage3 import default_g_bounded, adjust_wage_post_hire
+from post_hiring_adjust_wage3 import default_g_bounded, adjust_wage_post_hire, firing_decision
 
 
 class JobMarketEnv(ParallelEnv):
@@ -41,6 +41,7 @@ class JobMarketEnv(ParallelEnv):
         max_interview_cost: float = 2.0,
         num_interview_cost_levels: int = 5,
         action_mode: str = "continuous",
+        firing_cost_multiplier: float = 1.0,
         firm_types: Optional[List[str]] = None,
         firm_type_premia: Optional[Dict[str, float]] = None,
         render_mode: Optional[str] = None,
@@ -65,6 +66,7 @@ class JobMarketEnv(ParallelEnv):
         self.initial_offer_vx = float(np.clip(initial_offer_vx, 0.0, 0.99))
         self.public_signal_variance = public_signal_variance
         self.max_timesteps = max_timesteps
+        self.firing_cost_multiplier = firing_cost_multiplier
 
         # Cap interview cost at 2.7 as requested
         max_cost = float(min(2.7, max_interview_cost))
@@ -88,12 +90,12 @@ class JobMarketEnv(ParallelEnv):
         if self.action_mode == "continuous":
             self.action_low = 0.0
             self.action_high = self.max_interview_cost
-            self.action_size = 1
+            self.action_size = num_workers  # Now a vector: one cost per worker
             self.idle_action = None
             self._action_spaces = {
                 agent: Box(
-                    low=np.array([self.action_low], dtype=np.float32),
-                    high=np.array([self.action_high], dtype=np.float32),
+                    low=np.zeros(num_workers, dtype=np.float32),
+                    high=np.full(num_workers, self.max_interview_cost, dtype=np.float32),
                     dtype=np.float32,
                 )
                 for agent in [f"company_{i}" for i in range(num_companies)]
@@ -161,14 +163,29 @@ class JobMarketEnv(ParallelEnv):
         mask = np.ones(self.action_size, dtype=np.int8)
         return mask
 
-    def _cost_from_action(self, action: Any) -> float:
+    def _costs_from_action(self, action: Any) -> np.ndarray:
+        """Extract per-worker interview costs from action.
+
+        Returns:
+            Array of shape (num_workers,) with interview cost for each worker
+        """
         if self.action_mode == "discrete":
+            # For discrete mode, action is still a scalar - apply to all workers
             idx = int(np.clip(int(action), 0, len(self.cost_levels) - 1))
-            return float(self.cost_levels[idx])
-        arr = np.asarray(action).reshape(-1)
+            cost = float(self.cost_levels[idx])
+            return np.full(self.num_workers, cost, dtype=np.float32)
+
+        # Continuous mode: action is a vector of costs per worker
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
         if arr.size == 0:
-            return 0.0
-        return float(np.clip(arr[0], self.action_low, self.action_high))
+            return np.zeros(self.num_workers, dtype=np.float32)
+        if arr.size != self.num_workers:
+            # Fallback: broadcast or pad
+            if arr.size == 1:
+                return np.full(self.num_workers, float(arr[0]), dtype=np.float32)
+            else:
+                arr = np.resize(arr, self.num_workers)
+        return np.clip(arr, self.action_low, self.action_high).astype(np.float32)
 
     def _init_state(self):
         self.timestep = 0
@@ -185,15 +202,16 @@ class JobMarketEnv(ParallelEnv):
         self.tenure = np.zeros(self.num_workers, dtype=np.float32)
         self.employed_by = np.full(self.num_workers, -1, dtype=int)
         self.wages = np.zeros(self.num_workers, dtype=np.float32)
-        self.company_profits: Dict[str, List[float]] = {agent: [0.0] for agent in self.agents}
+        self.company_profits: Dict[str, List[float]] = {agent: [0.0] for agent in self.possible_agents}
         self.last_step_finance = {
             agent: {
                 "profit": 0.0,
                 "wage": 0.0,
                 "screening_cost": 0.0,
+                "firing_cost": 0.0,
                 "reward": 0.0,
             }
-            for agent in self.agents
+            for agent in self.possible_agents
         }
 
     def _get_obs(self, agent: str) -> Dict[str, np.ndarray]:
@@ -233,6 +251,7 @@ class JobMarketEnv(ParallelEnv):
             "last_step_profit": float(self.last_step_finance[agent]["profit"]),
             "last_step_wage": float(self.last_step_finance[agent]["wage"]),
             "last_step_screening_cost": float(self.last_step_finance[agent]["screening_cost"]),
+            "last_step_firing_cost": float(self.last_step_finance[agent]["firing_cost"]),
             "last_step_reward": float(self.last_step_finance[agent]["reward"]),
             "worker_metrics": [
                 {
@@ -273,35 +292,44 @@ class JobMarketEnv(ParallelEnv):
         if not self.agents:
             return {}, {}, {}, {}, {}
 
-        # Map actions -> interview cost
-        costs = {agent: self._cost_from_action(actions.get(agent, self.idle_action)) for agent in self.agents}
+        # Map actions -> per-worker interview costs
+        # costs_per_worker[agent] = array of shape (num_workers,)
+        costs_per_worker = {
+            agent: self._costs_from_action(actions.get(agent, self.idle_action))
+            for agent in self.agents
+        }
         screening_costs = {agent: 0.0 for agent in self.agents}
 
         interviewed_mask = np.zeros((self.num_companies, self.num_workers), dtype=bool)
         unemployed_workers = np.where(self.employed_by < 0)[0]
 
-        # 1) Interview: draw from sigma_hat, update via interview0
+        # 1) Interview with per-worker costs
+        # Each firm can interview any worker; multiple firms can interview the same worker
+        # Each firm that interviews a worker updates their own private belief σ̃_{ij}
         for firm_idx, agent in enumerate(self.agents):
             remaining_capacity = max(0, self._capacity(firm_idx) - int(np.sum(self.employed_by == firm_idx)))
-            if remaining_capacity <= 0 or unemployed_workers.size == 0:
+            if remaining_capacity <= 0:
                 continue
-            n_interviews = min(
-                unemployed_workers.size,
-                max(1, int(np.ceil(0.5 * remaining_capacity))),
-            )
-            candidates_sorted = unemployed_workers[np.argsort(self.sigma_hat[unemployed_workers])[::-1]]
-            candidates = candidates_sorted[:n_interviews]
-            cost_val = float(costs[agent])
-            for worker_id in candidates:
-                sigma_tilde_draw = self.screening.screen_worker(
-                    sigma_true=np.array([self.sigma_true[worker_id]], dtype=np.float32),
-                    interview_costs=np.array([cost_val], dtype=np.float32),
-                    sigma_hat=np.array([self.sigma_hat[worker_id]], dtype=np.float32),
-                )[0]
-                self.sigma_tilde[firm_idx, worker_id] = sigma_tilde_draw
-                self.interview_vars[firm_idx, worker_id] = float(self.screening.interview_var(cost_val))
-                interviewed_mask[firm_idx, worker_id] = True
-                screening_costs[agent] += cost_val
+
+            worker_costs = costs_per_worker[agent]  # (num_workers,)
+
+            # Firm interviews any unemployed worker with cost > 0
+            for worker_id in unemployed_workers:
+                cost_val = float(worker_costs[worker_id])
+                if cost_val > 0.0:  # Firm wants to interview this worker
+                    # Generate firm i's private signal about worker j: σ̃_{ij}
+                    # This is independent across firms (each gets their own noisy assessment)
+                    sigma_tilde_draw = self.screening.screen_worker(
+                        sigma_true=np.array([self.sigma_true[worker_id]], dtype=np.float32),
+                        interview_costs=np.array([cost_val], dtype=np.float32),
+                        sigma_hat=np.array([self.sigma_hat[worker_id]], dtype=np.float32),
+                    )[0]
+
+                    # Update firm i's private belief about worker j
+                    self.sigma_tilde[firm_idx, worker_id] = sigma_tilde_draw
+                    self.interview_vars[firm_idx, worker_id] = float(self.screening.interview_var(cost_val))
+                    interviewed_mask[firm_idx, worker_id] = True
+                    screening_costs[agent] += cost_val
 
         # 2) Matching: firms offer to 20% of the workers they interviewed
         remaining_capacity = [
@@ -358,6 +386,30 @@ class JobMarketEnv(ParallelEnv):
             )
             self.wages[worker_id] = float(wage_res.wage_t) * self.wage_scale * self._wage_multiplier(firm_id)
 
+        # 4) Firing decision: fire workers with excessive losses
+        firing_costs = {agent: 0.0 for agent in self.agents}
+        for worker_id, firm_id in enumerate(self.employed_by):
+            if firm_id < 0:
+                continue
+            agent = f"company_{firm_id}"
+            profit = float(profits_per_worker[worker_id])
+            wage = float(self.wages[worker_id])
+            c_fire = self.firing_cost_multiplier * wage
+
+            fire_result = firing_decision(
+                p_ijt=profit,
+                w_ijt=wage,
+                c_fire_t=c_fire,
+            )
+
+            if fire_result.fire:
+                # Fire the worker: set employment status to unemployed
+                self.employed_by[worker_id] = -1
+                self.tenure[worker_id] = 0.0
+                self.wages[worker_id] = 0.0
+                # Add firing cost (severance payment)
+                firing_costs[agent] += c_fire
+
         (
             self.sigma_tilde,
             self.sigma_hat,
@@ -391,13 +443,14 @@ class JobMarketEnv(ParallelEnv):
 
         rewards = {}
         for agent in self.agents:
-            reward = total_profits[agent] - total_wages[agent] - screening_costs[agent]
+            reward = total_profits[agent] - total_wages[agent] - screening_costs[agent] - firing_costs[agent]
             rewards[agent] = float(reward)
             self.company_profits[agent].append(float(reward))
             self.last_step_finance[agent] = {
                 "profit": float(total_profits[agent]),
                 "wage": float(total_wages[agent]),
                 "screening_cost": float(screening_costs[agent]),
+                "firing_cost": float(firing_costs[agent]),
                 "reward": float(reward),
             }
 
