@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 import numpy as np
-from generated_profit3 import normalize_profit_signal
+from generated_profit2 import normalize_profit_signal
 
 
 @dataclass
@@ -142,11 +142,11 @@ def adjust_wage_post_hire(
     if K1 > 0.0:
         vx_denom = 1.0 + (exp_t - 1.0) * K1
         if abs(vx_denom) < 1e-12:
-            vx = 0.3  # fallback to constant when denominator vanishes
+            vx = 0.7  # fallback to constant when denominator vanishes
         else:
             vx = (exp_t * K1) / vx_denom
     else:
-        vx = 0.3  # fallback to constant when K1 is zero
+        vx = 0.7  # fallback to constant when K1 is zero
 
     # Choose g(·)
     if g is None:

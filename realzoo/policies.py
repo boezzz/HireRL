@@ -2,11 +2,9 @@
 Baseline Policies for Job Market Environment
 
 This module implements simple baseline policies for testing and comparison:
-1. Random Policy: Random actions
+1. Random Policy: Random actions (80% greedy, 20% random)
 2. Greedy Policy: Always hire best available worker, fire worst performer
-3. No-Screening Policy: Never interview, rely on public signals
-4. High-Screening Policy: Always interview before hiring
-5. Never-Fire Policy: Never fire workers
+3. stable macthing?
 """
 
 import numpy as np

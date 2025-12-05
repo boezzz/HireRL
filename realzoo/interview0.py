@@ -62,25 +62,34 @@ class ScreeningMechanism:
             self._rng = np.random.RandomState(seed)
 
     # ------------------------------------------------------------------
-    # Cost -> variance map
+    # Public signal (sigma_hat) helpers up to interview time
     # ------------------------------------------------------------------
-    def interview_var(self, cost: float) -> float:
-        """Return interview signal variance δ^2(c) for a given cost.
-
-        δ^2(c) = δ0^2 * exp(-λ c)
-
-        Args
-        ----
-        cost:
-            Interview/screening cost c >= 0.
-
-        Returns
-        -------
-        float
-            Signal noise variance δ^2(c).
+    @staticmethod
+    def init_sigma_hat(
+        sigma_true: np.ndarray,
+        noise_std: float = 1.0,
+        sigma_hat_min: float = -2.0,
+        sigma_hat_max: float = 2.0,
+        rng: Optional[np.random.RandomState] = None,
+    ) -> np.ndarray:
         """
-        c = max(0.001, float(cost))
-        return float(self.delta0_sq * np.exp(-self.lam * c))
+        Initialize public signal: sigma_hat_0 = sigma_true + N(0, noise_std^2), clipped.
+        """
+        r = rng if rng is not None else np.random.mtrand._rand  # type: ignore[attr-defined]
+        noise = r.randn(*sigma_true.shape).astype(np.float32) * noise_std
+        sigma_hat_0 = sigma_true + noise
+        return np.clip(sigma_hat_0, sigma_hat_min, sigma_hat_max).astype(np.float32)
+
+    def interview_var(self, cost: float | np.ndarray) -> np.ndarray:
+        """
+        Cost-to-variance mapping δ^2(c) = δ0^2 * exp(-λ c).
+
+        This small helper keeps the core `screen_worker` logic untouched while
+        exposing the paper's variance schedule for downstream modules that need
+        δ^2(c) explicitly (e.g., wage updates based on interview precision).
+        """
+        c_arr = np.asarray(cost, dtype=np.float32)
+        return (self.delta0_sq * np.exp(-self.lam * c_arr)).astype(np.float32)
 
 
     # ------------------------------------------------------------------
@@ -89,10 +98,10 @@ class ScreeningMechanism:
     def screen_worker(
         self,
         sigma_true: np.ndarray,
-        sigma_hat_0: Optional[np.ndarray],  # kept for API compatibility; not used
-        cost: float,
-    ) -> Tuple[np.ndarray, float]:
-        """Generate a private interview signal for a single worker.
+        interview_costs: np.ndarray,
+        sigma_hat: np.ndarray
+    ) -> np.ndarray:
+        """Generate a private interview signal for an array of workers.
 
         Implements:
             \tilde{σ}_{ij} = σ_j + η_{ij},  η_{ij} ~ N(0, δ^2(c))
@@ -105,12 +114,12 @@ class ScreeningMechanism:
             Public initial signal \hat{σ}_{j,0}. Included for interface
             compatibility but not used in the current paper-consistent
             specification, where the interview signal is centered on σ_j.
-        cost:
-            Interview cost c_{interview,ij} >= 0.
+        interview_costs:
+            Interview cost c_{interview,ij} >= 0. If cost is 0, they were not interviewed.
 
         Returns
         -------
-        tilde_sigma: np.ndarray
+        sigma_tilde: np.ndarray
             The private interview signal \tilde{σ}_{ij} with the same shape
             as `sigma_true`.
         precision: float
@@ -119,75 +128,21 @@ class ScreeningMechanism:
             where 0 means "no extra information" (cost=0) and 1 means
             "maximal precision" (cost → ∞).
         """
-        var = self.interview_var(cost)
-        std = float(np.sqrt(var))
+        if sigma_hat is None:
+            raise ValueError("sigma_hat_0 must be provided to align sigma_tilde with public signal.")
 
-        # Draw Gaussian noise with the target variance
-        noise = self._rng.randn(*sigma_true.shape).astype(np.float32) * std
-        tilde_sigma = sigma_true + noise
+        c_arr = np.asarray(interview_costs, dtype=float).reshape(-1)
+        sigma_hat = np.asarray(sigma_hat, dtype=np.float32).reshape(-1)
+        sigma_true_arr = np.asarray(sigma_true, dtype=np.float32).reshape(-1)
 
-        # Precision summary in [0,1]
-        precision = float(1.0 - var / self.delta0_sq) if self.delta0_sq > 0 else 0.0
+        # Where cost=0, skip and keep base; else add noise with cost-based std capped below public noise
+        noise_sigma_hat = sigma_hat - sigma_true_arr
+        moving_step_size = ((noise_sigma_hat**2)/(1+noise_sigma_hat**2))*((c_arr**2)/(1+c_arr))
+        sigma_tilde = sigma_true_arr - moving_step_size * np.sign(noise_sigma_hat)
 
-        return tilde_sigma.astype(np.float32), precision
+        # For zero-cost entries, keep base exactly
+        zero_mask = c_arr == 0
+        if np.any(zero_mask):
+            sigma_tilde[zero_mask] = sigma_hat[zero_mask]
 
-    # ------------------------------------------------------------------
-    # Optional batch helper
-    # ------------------------------------------------------------------
-    def screen_batch(
-        self,
-        sigma_true_batch: np.ndarray,
-        sigma_hat0_batch: Optional[np.ndarray],  # unused, kept for symmetry
-        cost_batch: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Vectorized screening for a batch of workers.
-
-        Args
-        ----
-        sigma_true_batch:
-            Array of true abilities, shape (N, ...) where ... are ability dims.
-        sigma_hat0_batch:
-            Public initial signals (ignored in current implementation).
-        cost_batch:
-            Array of costs c_{interview,ij} with shape (N,).
-
-        Returns
-        -------
-        tilde_sigma_batch: np.ndarray
-            Interview signals for each worker, same shape as sigma_true_batch.
-        precision_batch: np.ndarray
-            Precision summary for each worker, shape (N,).
-        """
-        sigma_true_batch = np.asarray(sigma_true_batch)
-        cost_batch = np.asarray(cost_batch, dtype=float)
-
-        if sigma_true_batch.ndim == 1:
-            # Make it (N,1) for broadcasting, then squeeze back
-            sigma_true = sigma_true_batch[:, None]
-            extra_dim = True
-        else:
-            sigma_true = sigma_true_batch
-            extra_dim = False
-
-        N = sigma_true.shape[0]
-        if cost_batch.shape[0] != N:
-            raise ValueError("cost_batch must have the same length as sigma_true_batch")
-
-        vars_ = np.array([self.interview_var(c) for c in cost_batch], dtype=float)
-        stds = np.sqrt(vars_)  # shape (N,)
-
-        noise = self._rng.randn(*sigma_true.shape).astype(np.float32)
-        # Broadcast stds along ability dimensions
-        while stds.ndim < noise.ndim:
-            stds = stds[:, None]
-        noise *= stds
-
-        tilde_sigma = sigma_true + noise
-        precision = np.where(self.delta0_sq > 0.0,
-                             1.0 - vars_ / self.delta0_sq,
-                             0.0)
-
-        if extra_dim:
-            tilde_sigma = tilde_sigma[:, 0]
-
-        return tilde_sigma.astype(np.float32), precision.astype(np.float32)
+        return sigma_tilde.astype(np.float32)

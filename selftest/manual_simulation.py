@@ -35,29 +35,26 @@ from real_data_init.sde import (
 )
 
 
-def normalize_action_mask(action_mask, num_workers: int) -> np.ndarray:
-    """Ensure action mask is a boolean vector of length num_workers."""
+def normalize_action_mask(action_mask, action_size: int) -> np.ndarray:
+    """Ensure action mask is a boolean vector of length action_size."""
     mask_arr = np.asarray(action_mask).astype(bool).flatten()
-    if mask_arr.size != num_workers:
+    if mask_arr.size != action_size:
         fill_val = bool(mask_arr[0]) if mask_arr.size > 0 else True
-        mask_arr = np.full(num_workers, fill_val, dtype=bool)
+        mask_arr = np.full(action_size, fill_val, dtype=bool)
     return mask_arr
 
 
-def choose_manual_action(action_space, action_mask, max_cost: float, num_workers: int) -> np.ndarray:
+def choose_manual_action(action_space, action_mask, max_cost: float) -> float | int:
     """
-    Select a deterministic action for debugging.
+    Select a deterministic action (single interview cost).
 
-    Outputs a cost vector (one entry per worker). Default: half max cost for
-    available workers, zero otherwise. Falls back to max for discrete.
+    Continuous: half max cost if allowed; Discrete: choose highest valid index.
     """
-    mask_arr = normalize_action_mask(action_mask, num_workers)
-    costs = np.zeros(num_workers, dtype=np.float32)
+    mask_arr = normalize_action_mask(action_mask, getattr(action_space, "n", len(action_mask)))
     if isinstance(getattr(action_space, "n", None), int):
-        costs[mask_arr] = max_cost
-    else:
-        costs[mask_arr] = 0.5 * max_cost
-    return costs
+        valid_indices = [i for i, v in enumerate(mask_arr) if v]
+        return int(valid_indices[-1]) if valid_indices else 0
+    return float(0.5 * max_cost)
 
 
 def print_worker_metrics(infos: Dict[str, Dict], step: int):
@@ -76,17 +73,14 @@ def print_worker_metrics(infos: Dict[str, Dict], step: int):
 
 
 def compute_profit_signal(profit: float, sigma_true: float) -> float:
-    """
-    Override s(p) to equal sigma_true (for diagnostics/visualization).
-    """
+    """Diagnostic helper (currently unused hook)."""
     return float(sigma_true)
 
 
 def load_realistic_env(num_firms: int = 5,
                        employees_per_agent: float = 1_000.0,
                        random_state: int | None = 42,
-                       seed: int | None = 42,
-                       base_firing_cost: float = 6.0) -> Tuple[JobMarketEnv, List[str]]:
+                       seed: int | None = 42) -> Tuple[JobMarketEnv, List[str]]:
     """
     Build an env seeded by real firm sizes and wage premia.
     employees_per_agent 就是一把比例尺。公式很简单：
@@ -101,7 +95,11 @@ def load_realistic_env(num_firms: int = 5,
                                 random_state=random_state)
     capacities = to_env_capacities(firms_df, employees_per_agent=employees_per_agent)
     firm_types = firms_df["firm_type"].tolist()
-    premia = estimate_size_wage_premia()
+    try:
+        premia = estimate_size_wage_premia()
+    except Exception as e:
+        print(f"[warn] size premia estimation skipped ({e}); using neutral premia.")
+        premia = {"small": 1.0, "medium": 1.0, "large": 1.0, "generic": 1.0}
 
     # Calibrate signal noise to empirical wage variance drop if possible
     profit_noise_var = 0.05
@@ -131,8 +129,9 @@ def load_realistic_env(num_firms: int = 5,
 
     num_workers = sum(capacities)
     env = JobMarketEnv(
-        num_companies=len(capacities), #capacities： 每家实际雇佣的人数
-        num_workers=num_workers, #劳动力池的总人数
+        num_companies=len(capacities),
+        num_workers=num_workers,
+        max_workers_per_company=max(capacities) if capacities else 1,
         firm_capacities=capacities,
         firm_types=firm_types,
         firm_type_premia=premia,
@@ -140,13 +139,11 @@ def load_realistic_env(num_firms: int = 5,
         action_mode="continuous",
         max_interview_cost=2.0,
         profit_noise_var=profit_noise_var,
-        base_firing_cost=base_firing_cost,
         wage_scale=wage_scale,
         max_timesteps=100,
         seed=seed,
     )
     env.screening.delta0_sq = float(delta_interview0_sq)
-    # Use stochastic interview noise (per cost) and seeded RNG
     env.screening._rng = np.random.RandomState(seed)
     return env, firm_types
 
@@ -174,8 +171,6 @@ def run_manual_simulation():
     action_series = defaultdict(lambda: {'t': [], 'action': []})
     vx_series = defaultdict(lambda: {'t': [], 'vx': [], 'k1': []})
     horizon = 100
-    force_events = True  # push hires/fires early for visualization
-    force_window = 20    # only force within first N steps
 
     # Log reset (t=0) state so sigma_hat and sigma_tilde starting points are visible
     step = 0
@@ -215,26 +210,24 @@ def run_manual_simulation():
         # Workforce size at t=0
         company_idx = int(agent.split('_')[1])
         workforce_sizes[agent]['t'].append(step)
-        workforce_sizes[agent]['size'].append(len(env.worker_pool.get_employed_by_company(company_idx)))
+        workforce_sizes[agent]['size'].append(int(np.sum(env.employed_by == company_idx)))
     total_hires_per_step.append(0)
     total_fires_per_step.append(0)
     step_indices.append(0)
+    prev_employed_by = env.employed_by.copy()
+
+    base_interview_var = float(env.screening.interview_var(0.0))
 
     for step in range(1, horizon + 1):
         actions = {}
         for agent in env.agents:
             action_space = env.action_space(agent)
-            action_mask = normalize_action_mask(observations[agent]["action_mask"], env.num_workers)
+            action_mask = observations[agent]["action_mask"]
             actions[agent] = choose_manual_action(
-                action_space, action_mask, env.max_interview_cost, env.num_workers
+                action_space, action_mask, env.max_interview_cost
             )
-            if force_events and step <= force_window:
-                # Force maximum interview effort to trigger matching/hiring
-                forced = np.zeros(env.num_workers, dtype=np.float32)
-                forced[action_mask] = env.max_interview_cost
-                actions[agent] = forced
             action_series[agent]['t'].append(step)
-            action_series[agent]['action'].append(float(np.mean(actions[agent])))
+            action_series[agent]['action'].append(float(np.asarray(actions[agent]).reshape(-1)[0]))
 
         observations, rewards, terminations, truncations, infos = env.step(actions)
 
@@ -258,25 +251,26 @@ def run_manual_simulation():
         print_worker_metrics(infos, step=step)
         step_total_hires = 0
         step_total_fires = 0
+        agent_hires = {agent: 0 for agent in env.possible_agents}
+        agent_fires = {agent: 0 for agent in env.possible_agents}
+
         for agent in env.possible_agents:
             info = infos.get(agent)
             if info:
                 for entry in info.get('worker_metrics', []):
-                    # Track vx and k1 if available in info
                     vx_val = entry.get('vx')
                     k1_val = entry.get('k1')
                     profit_val = entry.get('profit')
-                    if profit_val is not None:
-                        profit_signal = compute_profit_signal(profit=profit_val, sigma_true=entry['sigma_true'])
+                    profit_signal = compute_profit_signal(profit=profit_val, sigma_true=entry['sigma_true']) if profit_val is not None else None
+                    if profit_signal is not None:
                         profit_signal_series[(agent, entry['worker_id'])]['t'].append(step)
                         profit_signal_series[(agent, entry['worker_id'])]['profit_signal'].append(profit_signal)
-                    else:
-                        profit_signal = None
                     if vx_val is not None and k1_val is not None:
                         key = (agent, entry['worker_id'])
                         vx_series[key]['t'].append(step)
                         vx_series[key]['vx'].append(vx_val)
                         vx_series[key]['k1'].append(k1_val)
+                    interview_var = entry.get('interview_cost')
                     csv_rows.append({
                         'timestep': step,
                         'agent': agent,
@@ -287,42 +281,35 @@ def run_manual_simulation():
                         'wage': entry['wage'],
                         'profit': profit_val,
                         'profit_signal': profit_signal,
-                        'action_value': float(actions[agent][entry['worker_id']]) if agent in actions else None,
-                        'interview_cost': entry['interview_cost'],
+                        'action_value': float(np.asarray(actions[agent]).reshape(-1)[0]) if agent in actions else None,
+                        'interview_var': interview_var,
                         'vx': vx_val,
                         'k1': k1_val,
                     })
-                    if entry['interview_cost'] > 0:
+                    if interview_var is not None and interview_var < base_interview_var - 1e-8:
                         key = (agent, entry['worker_id'])
                         interview_events[key]['t'].append(step)
-                        interview_events[key]['value'].append(entry['interview_cost'])
-                hires = info.get("hirings", [])
-                fires = info.get("firings", [])
-            else:
-                hires = []
-                fires = []
-            hire_counts[agent].append(len(hires))
-            fire_counts[agent].append(len(fires))
-            step_total_hires += len(hires)
-            step_total_fires += len(fires)
-            if info:
-                for worker_id in hires:
-                    hiring_events[(agent, worker_id)].append(step)
-                for worker_id in fires:
-                    firing_events[(agent, worker_id)].append(step)
+                        interview_events[key]['value'].append(interview_var)
 
-        # Optionally force a firing event for plotting within the window
-        if force_events and step <= force_window:
-            for agent in env.agents:
-                info = infos.get(agent, {})
-                company_idx = int(agent.split("_")[-1])
-                workforce = env.worker_pool.get_employed_by_company(company_idx)
-                if workforce and not info.get("firings"):
-                    victim = workforce[0]
-                    env.worker_pool.fire_worker(victim)
-                    info.setdefault("firings", []).append(victim)
-                    firings_record = firings_record if 'firings_record' in locals() else {}
-                    firing_events[(agent, victim)].append(step)
+        # Detect hires/fires based on employed_by changes
+        new_employed_by = env.employed_by.copy()
+        for worker_id, firm_id in enumerate(new_employed_by):
+            prev_firm = prev_employed_by[worker_id]
+            if prev_firm < 0 and firm_id >= 0:
+                agent = f"company_{firm_id}"
+                hiring_events[(agent, worker_id)].append(step)
+                agent_hires[agent] += 1
+                step_total_hires += 1
+            elif prev_firm >= 0 and firm_id < 0:
+                agent = f"company_{prev_firm}"
+                firing_events[(agent, worker_id)].append(step)
+                agent_fires[agent] += 1
+                step_total_fires += 1
+        prev_employed_by = new_employed_by
+
+        for agent in env.possible_agents:
+            hire_counts[agent].append(agent_hires.get(agent, 0))
+            fire_counts[agent].append(agent_fires.get(agent, 0))
 
         total_hires_per_step.append(step_total_hires)
         total_fires_per_step.append(step_total_fires)
@@ -332,7 +319,7 @@ def run_manual_simulation():
         for agent in env.possible_agents:
             company_idx = int(agent.split('_')[1])
             workforce_sizes[agent]['t'].append(step)
-            workforce_sizes[agent]['size'].append(len(env.worker_pool.get_employed_by_company(company_idx)))
+            workforce_sizes[agent]['size'].append(int(np.sum(env.employed_by == company_idx)))
         # Only break early if the env actually reports termination/truncation flags
         if (terminations and all(terminations.values())) or (truncations and all(truncations.values())):
             print("Episode ended early.")
@@ -342,11 +329,15 @@ def run_manual_simulation():
     with save_path.open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
             'timestep', 'agent', 'worker_id',
-            'sigma_true', 'sigma_hat', 'sigma_tilde', 'wage', 'profit', 'profit_signal', 'action_value', 'interview_cost',
+            'sigma_true', 'sigma_hat', 'sigma_tilde', 'wage', 'profit', 'profit_signal', 'action_value', 'interview_var',
             'vx', 'k1'
         ])
         writer.writeheader()
-        writer.writerows(csv_rows)
+        for row in csv_rows:
+            # Backward compatibility: allow older key name
+            if 'interview_var' not in row and 'interview_cost' in row:
+                row['interview_var'] = row.pop('interview_cost')
+            writer.writerow(row)
     print(f"\nSaved sigma/action log to {save_path}")
 
     sigma_series = defaultdict(lambda: {'t': [], 'sigma_true': [], 'sigma_hat': [], 'sigma_tilde': []})
