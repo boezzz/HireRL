@@ -99,7 +99,8 @@ class ScreeningMechanism:
         self,
         sigma_true: np.ndarray,
         interview_costs: np.ndarray,
-        sigma_hat: np.ndarray
+        sigma_hat: np.ndarray,
+        lr: float = 0.001
     ) -> np.ndarray:
         """Generate a private interview signal for an array of workers.
 
@@ -137,7 +138,9 @@ class ScreeningMechanism:
 
         # Where cost=0, skip and keep base; else add noise with cost-based std capped below public noise
         noise_sigma_hat = sigma_hat - sigma_true_arr
-        moving_step_size = ((noise_sigma_hat**2)/(1+noise_sigma_hat**2))*((c_arr**2)/(1+c_arr))
+
+        thing = c_arr * lr
+        moving_step_size = ((noise_sigma_hat**2)/(1+noise_sigma_hat**2))*((thing**2)/(1+thing))
         # this only help move one time step.
         sigma_tilde = sigma_true_arr - moving_step_size * np.sign(noise_sigma_hat)
 
