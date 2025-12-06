@@ -2,19 +2,7 @@
 
 """
 Post-hiring wage adjustment and firing decision rules.
-This file is intentionally phi-free. Any firm-type wage multipliers
-        (phi_type) are applied in the environment layer (JobMarketEnv) after
-        this base wage is computed, to avoid double-counting.
-
 Step 5 (Wage adjustment):
-    w_{j,t}
-    = (1 - v_x) g(\tilde{\sigma}_{ij, t = \text{interview}})
-      + v_x \psi \, p_{ij,t-1},
-
-    v_x = \frac{\exp_{j,t} K_1}{1 + (\exp_{j,t} - 1) K_1},
-    K_1 = \frac{\delta_{\text{interview}}^2}{\delta_{\text{interview}}^2 + \delta_{\varepsilon}^2},
-    \psi \in (0, 1).
-
 Step 6 (Firing rule):
     \text{fire}_{ij,t} = 1\{ p_{ij,t} - w_{ij,t} < - c_{i,t}^{\text{fire}} \},
     \quad C_{\text{fire}} \gg C_{\text{interview}}.
@@ -27,10 +15,10 @@ updating logic implemented elsewhere.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 import numpy as np
-from generated_profit2 import normalize_profit_signal
+from generated_profit2 import generate_profit_array, update_sigma_tilde_from_profit
 
 
 @dataclass
@@ -50,10 +38,9 @@ class WageAdjustmentResult:
         v_x \psi p_{ij,t-1}.
     """
 
-    wage_t: float
-    vx: float
-    signal_component: float
-    profit_component: float
+    wage: np.ndarray
+    signal_component: np.ndarray
+    profit_component: np.ndarray
 
 
 def default_g_bounded(x: np.ndarray, alpha: float = 0.5) -> np.ndarray:
@@ -71,101 +58,73 @@ def default_g_bounded(x: np.ndarray, alpha: float = 0.5) -> np.ndarray:
 
 
 def adjust_wage_post_hire(
-    sigma_tilde_initial: float,
-    p_ij_tm1: float,
-    exp_t: float,
-    delta_interview_sq: float,
-    delta_eps_sq: float,
+    sigma_tilde_interview: np.ndarray,
+    p_ij_tm1: Optional[np.ndarray] = None,
     psi: float = 0.5,
-    g: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-    profit_norm_method: str = "tanh",
-    profit_norm_scale: float = 1.0,
+    exp_t: Optional[np.ndarray] = None,
+    delta_interview_sq: Optional[np.ndarray] = None,
+    delta_eps_sq: Optional[np.ndarray] = None,
+    company_type: float = 1.0,
+    employed_by: Optional[np.ndarray] = None,
+    exp_tm1: Optional[np.ndarray] = None,
+    sigma_true: Optional[np.ndarray] = None,
+    g0: float = 0.1,
+    g1: float = 0.5,
+    theta: float = 0.05,
+    rng: Optional[np.random.RandomState] = None,
+    g_fn: Callable[[np.ndarray], np.ndarray] = default_g_bounded,
+    **unused,
 ) -> WageAdjustmentResult:
     """
     Compute the post-hiring wage using updated beliefs:
 
-        w_{j,t} = φ[(1-v_{j,t}) g(tilde_σ_{ij,t}) + v_{j,t} ψ p_{ij,t-1}]
+        w_{j,t} = company_time * [(1-v_{j,t}) g(tilde_σ_{ij,t}) + v_{j,t} ψ p_{ij,t-1}]
 
-    where tilde_σ_{ij,t} is the current updated belief (evolves with performance),
-    and v_{j,t} increases with worker experience/tenure.
-
-        v_x = [exp_{j,t} K_1] / [1 + (exp_{j,t} - 1) K_1],
-        K_1 = delta_interview^2 / (delta_interview^2 + delta_eps^2).
-
-    Args
-    ----
-    sigma_tilde_initial : float
-        Current updated belief tilde_σ_{ij,t} (parameter name kept for compatibility).
-    p_ij_tm1 : float
-        Realized profit p_{ij,t-1} from the previous period.
-    exp_t : float
-        Experience level exp_{j,t} used in the v_x formula.
-    delta_interview_sq : float
-        Interview noise variance \delta_{\text{interview}}^2.
-    delta_eps_sq : float
-        Profit noise variance \delta_{\varepsilon}^2.
-    psi : float, optional
-        Share of profit passed through to wages, \psi \in (0, 1).
-    g : callable, optional
-        Function g(·) applied to the interview signal. If None, use
-        the bounded, diminishing-returns default g defined above.
-
-    Returns
-    -------
-    WageAdjustmentResult
-        Contains the new wage, the v_x used, and the signal/profit
-        components of the wage rule.
-
-    Note:
-        This function is intentionally phi-free. Any firm-type wage multipliers
-        (phi_type) are applied in the environment layer (JobMarketEnv) after
-        this base wage is computed, to avoid double-counting.
     """
-    sigma_tilde_initial = float(sigma_tilde_initial)
-    p_ij_tm1_raw = float(p_ij_tm1)
-    p_ij_tm1 = normalize_profit_signal(p_ij_tm1_raw, method=profit_norm_method, scale=profit_norm_scale)
-    exp_t = max(0.0, float(exp_t))
-    delta_interview_sq = float(delta_interview_sq)
-    delta_eps_sq = float(delta_eps_sq)
-    psi = float(psi)
+    if sigma_true is None:
+        raise ValueError("sigma_true must be provided for belief updating")
 
-    if not (0.0 < psi < 1.0):
-        raise ValueError(f"psi must be in (0, 1), got {psi}.")
+    mask = None
+    if employed_by is not None:
+        mask = np.asarray(employed_by, dtype=float)
 
-    # Compute K_1 and v_x as in the belief-updating formula
-    denom = delta_interview_sq + delta_eps_sq
-    if denom > 0.0:
-        K1 = delta_interview_sq / denom
-    else:
-        K1 = 0.0
+    profit_prev = p_ij_tm1
+    if profit_prev is None:
+        if exp_tm1 is None or sigma_true is None or employed_by is None:
+            raise ValueError(
+                "p_ij_tm1 missing: provide exp_tm1, sigma_true, employed_by to generate profit."
+            )
+        profit_prev = generate_profit_array(
+            exp_tm1=np.asarray(exp_tm1, dtype=float),
+            sigma_true=np.asarray(sigma_true, dtype=float),
+            employed_by=np.asarray(employed_by, dtype=float),
+            g0=float(g0),
+            g1=float(g1),
+            theta=float(theta),
+            delta_eps_sq=float(np.asarray(delta_eps_sq, dtype=float).mean()),
+            rng=rng,
+        )
 
-    if K1 > 0.0:
-        vx_denom = 1.0 + (exp_t - 1.0) * K1
-        if abs(vx_denom) < 1e-12:
-            vx = 0.7  # fallback to constant when denominator vanishes
-        else:
-            vx = (exp_t * K1) / vx_denom
-    else:
-        vx = 0.7  # fallback to constant when K1 is zero
+    profit_prev = np.asarray(profit_prev, dtype=float)
 
-    # Choose g(·)
-    if g is None:
-        g = default_g_bounded
+    _, _, vx = update_sigma_tilde_from_profit(
+        sigma_tilde_interview=sigma_tilde_interview,
+        sigma_true=sigma_true,
+        exp_t=exp_t,
+        delta_interview_sq=delta_interview_sq,
+        delta_eps_sq=delta_eps_sq,
+    )
 
-    # Apply g to the (scalar) updated belief signal
-    g_input = np.array([sigma_tilde_initial], dtype=float)
-    g_val = float(g(g_input)[0])
+    g_val = g_fn(sigma_tilde_interview)
+    if mask is not None:
+        g_val = g_val * mask
+        profit_prev = profit_prev * mask
 
     signal_component = (1.0 - vx) * g_val
-    profit_component = vx * psi * p_ij_tm1
-    wage_t = signal_component + profit_component
+    profit_component = vx * psi * profit_prev
+    wage = (signal_component + profit_component) * company_type
 
-    return WageAdjustmentResult(
-        wage_t=float(wage_t),
-        vx=float(vx),
-        signal_component=float(signal_component),
-        profit_component=float(profit_component),
-    )
+    return wage
 
 
 @dataclass
@@ -189,9 +148,9 @@ class FiringDecisionResult:
 
 
 def firing_decision(
-    p_ijt: float,
-    w_ijt: float,
-    c_fire_t: float,
+    profit: np.ndarray,
+    wage: np.ndarray,
+    c_fire_t: np.ndarray
 ) -> FiringDecisionResult:
     """
     Implement the deterministic firing rule
@@ -215,11 +174,8 @@ def firing_decision(
     FiringDecisionResult
         Contains the firing indicator, the net margin, and the threshold.
     """
-    p_ijt = float(p_ijt)
-    w_ijt = float(w_ijt)
-    c_fire_t = float(c_fire_t)
 
-    margin = p_ijt - w_ijt
+    margin = profit - wage
     threshold = -c_fire_t
     fire = margin < threshold
 

@@ -138,7 +138,9 @@ class ScreeningMechanism:
         # Where cost=0, skip and keep base; else add noise with cost-based std capped below public noise
         noise_sigma_hat = sigma_hat - sigma_true_arr
         moving_step_size = ((noise_sigma_hat**2)/(1+noise_sigma_hat**2))*((c_arr**2)/(1+c_arr))
+        # this only help move one time step.
         sigma_tilde = sigma_true_arr - moving_step_size * np.sign(noise_sigma_hat)
+
 
         # For zero-cost entries, keep base exactly
         zero_mask = c_arr == 0
