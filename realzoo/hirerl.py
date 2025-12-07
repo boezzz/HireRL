@@ -7,8 +7,14 @@ from gymnasium.spaces import Box, Dict as GymDict, MultiBinary, Discrete
 from pettingzoo.utils.env import ParallelEnv
 
 from interview0 import ScreeningMechanism
-from matching1 import greedy_wage_matching_from_signals, WageMatchingResult
-from generated_profit2 import generate_profit_array, update_beliefs_and_experience
+from matching1 import firm_offer, worker_wage_accepted, FirmWageOffers, FinalOffers
+from generated_profit2 import (
+    generate_profit_array,
+    update_sigma_tilde_from_profit,
+    update_sigma_hat_accepted,
+    update_sigma_no_offer,
+    update_experience,
+)
 from post_hiring_adjust_wage3 import default_g_bounded, adjust_wage_post_hire, firing_decision
 
 
@@ -331,39 +337,58 @@ class JobMarketEnv(ParallelEnv):
                     interviewed_mask[firm_idx, worker_id] = True
                     screening_costs[agent] += cost_val
 
-        # 2) Matching: firms offer to 20% of the workers they interviewed
+        # 2) Matching: firms offer to 30% of the workers they interviewed
         remaining_capacity = [
             max(0, self._capacity(i) - int(np.sum(self.employed_by == i)))
             for i in range(self.num_companies)
         ]
-        matching_result: WageMatchingResult = greedy_wage_matching_from_signals(
-            sigma_tilde=self.sigma_tilde,
-            interviewed_mask=interviewed_mask,
-            capacities=remaining_capacity,
-            eligible_workers=unemployed_workers,
-            v_x=self.initial_offer_vx,
-            g=default_g_bounded,
-            firm_multipliers=[self._wage_multiplier(i) for i in range(self.num_companies)],
-        )
 
-        for worker_id, firm_id in matching_result.worker_to_firm.items():
-            if firm_id is None:
-                continue
-            if self.employed_by[worker_id] != -1:
-                continue
-            if remaining_capacity[firm_id] <= 0:
-                continue
-            wage_offer = matching_result.worker_wage.get(worker_id, 0.0)
-            self.employed_by[worker_id] = firm_id
-            self.wages[worker_id] = float(wage_offer) * self.wage_scale * self._wage_multiplier(firm_id)
-            self.tenure[worker_id] = 0.0
-            remaining_capacity[firm_id] -= 1
+        # Generate offers from each firm
+        firm_offers = []
+        for firm_idx in range(self.num_companies):
+            offer = firm_offer(
+                sigma_tilde=self.sigma_tilde[firm_idx],
+                interviewed_mask=interviewed_mask[firm_idx],
+                offer_rate=0.3,
+                g=default_g_bounded,
+                firm_multiplier=self._wage_multiplier(firm_idx),
+                firm_id=firm_idx,
+            )
+            firm_offers.append(offer)
+
+        # Workers accept best offers
+        matching_results = worker_wage_accepted(firm_offers, self.sigma_tilde[0])
+
+        # Process accepted offers
+        for result in matching_results:
+            firm_id = result.firm_id
+            new_hires_mask = result.employeed_by.astype(bool)
+
+            for worker_id in np.where(new_hires_mask)[0]:
+                # Check constraints
+                if self.employed_by[worker_id] != -1:
+                    continue
+                if worker_id not in unemployed_workers:
+                    continue
+                if remaining_capacity[firm_id] <= 0:
+                    continue
+
+                # Get wage from firm's offer
+                wage_offer = firm_offers[firm_id].wage_array[worker_id]
+
+                # Hire the worker
+                self.employed_by[worker_id] = firm_id
+                self.wages[worker_id] = float(wage_offer) * self.wage_scale
+                self.tenure[worker_id] = 0.0
+                remaining_capacity[firm_id] -= 1
 
         # 3) Profit draw + wage adjustment + belief/experience update
+        # Create binary mask: 1 if employed by any firm, 0 if unemployed
+        employed_mask = (self.employed_by >= 0).astype(np.int8)
         profits_per_worker = generate_profit_array(
             exp_tm1=self.experience,
-            sigma_j=self.sigma_true,
-            employed_by=self.employed_by,
+            sigma_true=self.sigma_true,
+            employed_by=employed_mask,
             g0=self.g0,
             g1=self.g1,
             theta=self.profit_theta,
@@ -375,16 +400,18 @@ class JobMarketEnv(ParallelEnv):
             if firm_id < 0:
                 continue
             delta_interview_sq = float(self.interview_vars[firm_id, worker_id])
-            wage_res = adjust_wage_post_hire(
-                sigma_tilde_initial=float(self.sigma_tilde[firm_id, worker_id]),
+            exp_t = max(float(self.experience[worker_id]), 1) # avoid division by zero
+            wage = adjust_wage_post_hire(
+                sigma_tilde_interview=float(self.sigma_tilde[firm_id, worker_id]),
                 p_ij_tm1=float(profits_per_worker[worker_id]),
-                exp_t=float(self.experience[worker_id]),
+                exp_t=exp_t,
                 delta_interview_sq=delta_interview_sq,
                 delta_eps_sq=self.delta_eps_sq,
                 psi=self.wage_profit_share,
-                g=default_g_bounded,
+                sigma_true=float(self.sigma_true[worker_id]),
+                g_fn=default_g_bounded,
             )
-            self.wages[worker_id] = float(wage_res.wage_t) * self.wage_scale * self._wage_multiplier(firm_id)
+            self.wages[worker_id] = float(wage) * self.wage_scale
 
         # 4) Firing decision: fire workers with excessive losses
         firing_costs = {agent: 0.0 for agent in self.agents}
@@ -394,40 +421,73 @@ class JobMarketEnv(ParallelEnv):
             agent = f"company_{firm_id}"
             profit = float(profits_per_worker[worker_id])
             wage = float(self.wages[worker_id])
-            c_fire = self.firing_cost_multiplier * wage
 
             fire_result = firing_decision(
-                p_ijt=profit,
-                w_ijt=wage,
-                c_fire_t=c_fire,
+                profit=profit,
+                wage=wage,
+                c_fire_t=0.0,
             )
 
             if fire_result.fire:
                 # Fire the worker: set employment status to unemployed
+                c_fire = 6.0 * wage # maybe not hardcode this one
                 self.employed_by[worker_id] = -1
                 self.tenure[worker_id] = 0.0
                 self.wages[worker_id] = 0.0
                 # Add firing cost (severance payment)
                 firing_costs[agent] += c_fire
 
-        (
-            self.sigma_tilde,
-            self.sigma_hat,
-            self.experience,
-            vx_per_worker,
-        ) = update_beliefs_and_experience(
-            sigma_tilde=self.sigma_tilde,
-            sigma_hat=self.sigma_hat,
-            sigma_true=self.sigma_true,
-            employed_by=self.employed_by,
-            experience=self.experience,
-            profits=profits_per_worker,
-            interview_vars=self.interview_vars,
-            delta_eps_sq=self.delta_eps_sq,
-            g0=self.g0,
-            g1=self.g1,
-            theta=self.profit_theta,
-        )
+        # 5) Update beliefs and experience using new separate functions
+        sigma_hat_next = self.sigma_hat.copy()
+        sigma_tilde_next = self.sigma_tilde.copy()
+
+        for worker_id in range(self.num_workers):
+            firm_id = self.employed_by[worker_id]
+
+            if firm_id < 0:
+                # worker unemployed
+                sigma_hat_no_offer, sigma_tilde_no_offer = update_sigma_no_offer(self.sigma_hat[worker_id])
+                sigma_hat_next[worker_id] = float(sigma_hat_no_offer)
+                # all firms set their sigma_tilde to sigma_tilde_no_offer
+                sigma_tilde_next[:, worker_id] = float(sigma_tilde_no_offer)
+            else:
+                # worker employed, update beliefs based on profit
+                exp_t = max(float(self.experience[worker_id]), 1.0)
+                delta_interview_sq = float(self.interview_vars[firm_id, worker_id])
+
+                sigma_tilde_new, sigma_update, vx = update_sigma_tilde_from_profit(
+                    sigma_tilde_interview=float(self.sigma_tilde[firm_id, worker_id]),
+                    sigma_true=float(self.sigma_true[worker_id]),
+                    exp_t=exp_t,
+                    delta_interview_sq=delta_interview_sq,
+                    delta_eps_sq=self.delta_eps_sq,
+                )
+
+                # update hiring firm's sigma_tilde
+                sigma_tilde_next[firm_id, worker_id] = float(sigma_tilde_new)
+
+                # update public signal sigma_hat
+                sigma_hat_next[worker_id] = float(
+                    update_sigma_hat_accepted(
+                        sigma_tilde=float(self.sigma_tilde[firm_id, worker_id]),
+                        sigma_update=float(sigma_update),
+                    )
+                )
+
+        self.sigma_hat = sigma_hat_next
+        self.sigma_tilde = sigma_tilde_next
+
+        # update experience for all workers
+        for firm_idx in range(self.num_companies):
+            employed_mask = (self.employed_by == firm_idx).astype(np.int8)
+            self.experience = update_experience(
+                exp_t=self.experience,
+                sigma_true=self.sigma_true,
+                employed_by=employed_mask,
+                g0=self.g0,
+                g1=self.g1,
+                theta=self.profit_theta,
+            )
 
         self.tenure = self.tenure + (self.employed_by >= 0).astype(np.float32)
 
