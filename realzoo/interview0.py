@@ -141,7 +141,7 @@ class ScreeningMechanism:
         noise_sigma_hat = sigma_hat - sigma_true_arr
         print("Difference between sigma_hat and sigma_true: ", noise_sigma_hat)
 
-        if c_arr * lr > 2.7:
+        if c_arr * lr > 2.7 or lr <= 0 or lr > 1 :
             raise ValueError("cost and learning rate cannot be larger then 2.7 by math")
 
         thing = c_arr * lr
