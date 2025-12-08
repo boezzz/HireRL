@@ -3,3 +3,6 @@ gymnasium>=0.28.0
 pettingzoo>=1.23.0
 torch>=2.0.0
 tensorboard>=2.10.0
+matplotlib>=3.10.7
+seaborn
+tensorflow

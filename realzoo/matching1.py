@@ -98,13 +98,25 @@ def get_offer_mask(num_offers: int, sigma_tilde: np.ndarray, interviewed_mask: n
 
 def worker_wage_accepted(
         firm_offers: Sequence[FirmWageOffers],
-        sigma_tilde:np.ndarray
+        num_workers: int,
+        rnd: Optional[np.random.RandomState] = None,
+        greedy_chance: float = 0.8
 ) -> Sequence[FinalOffers]:
     """
     Given offers from multiple firms, let each worker accept the best wage.
     returns a dictionary, worker_id, firm_id they chose, the wage they accept
 
+    greedy_chance: probability the employee chooses the first offer greedily. If they don't just top, it evaluates the second offer.
     """
+    if rnd is None:
+        rnd = np.random.RandomState()
+
+    def greedy_max_num(num_offers_for_worker: int, greedy_chance: float) -> int:
+        # if the bimonial evaluates to true, chooses that offer (greedily), otherwise, looks at next offer greedily
+        for i in range(0, num_offers_for_worker):
+            if rnd.binomial(1, greedy_chance):
+                return i
+        return num_offers_for_worker - 1 # accepts the worst offer with prob. (1 - greedy_chance)^num_offers_for_worker
 
     offered_wage = {}
     for firm_offer_obj in firm_offers:
@@ -123,8 +135,10 @@ def worker_wage_accepted(
     # map of company to newly hired worker ids
     company_to_new_workers = {}
     for worker, worker_offers in offered_wage.items():
-        # max(..., key=lambda x: x[1])  按 tuple 的第二个值比较
-        best_offer_for_worker = max(worker_offers, key=lambda x: x[1])
+        kth_max = greedy_max_num(len(worker_offers), greedy_chance) # 0 is highest offer
+        # note: quickselect could be slightly faster here
+        # sort list from highest to lowest offer
+        best_offer_for_worker = sorted(worker_offers, key=lambda x: x[1], reverse=True)[kth_max]
         wage_matching_result_for_worker[worker] = best_offer_for_worker
         company_new_workers = company_to_new_workers.get(best_offer_for_worker[0], [])
         company_new_workers.append(worker)
@@ -132,7 +146,7 @@ def worker_wage_accepted(
 
     offer_results = []
     for firm_id, new_employees in company_to_new_workers.items():
-        employment_mask = np.zeros(sigma_tilde.shape)
+        employment_mask = np.zeros(num_workers)
         employment_mask[new_employees] = 1
         offer_results.append(FinalOffers(firm_id, employment_mask))
 
@@ -205,7 +219,7 @@ def _test_worker_wage_accepted():
         firm_id=1,
         wage_array=np.array([0.5, 1.0, 0, 2.8, 0, 3.6, 2.0, 0, 4.2, 0]),
     )
-    results = worker_wage_accepted([firm_a, firm_b], sigma_tilde)
+    results = worker_wage_accepted([firm_a, firm_b], 10, greedy_chance=1.0) # greedy_chance=0.0 to pass unit tests deterministically
     results = sorted(results, key=lambda r: r.firm_id)
     print("== test_worker_wage_accepted ==")
     for res in results:
@@ -240,7 +254,7 @@ def _test_private_sigma_tilde_per_firm():
         firm_id=1,
     )
 
-    results = worker_wage_accepted([offers_a, offers_b], sigma_firm_a)
+    results = worker_wage_accepted([offers_a, offers_b], 10, greedy_chance=1.0) # greedy_chance=1.0 to pass unit tests deterministically
     results = sorted(results, key=lambda r: r.firm_id)
 
     print("== test_private_sigma_tilde_per_firm ==")

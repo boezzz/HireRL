@@ -69,8 +69,8 @@ class ScreeningMechanism:
     def init_sigma_hat(
         sigma_true: np.ndarray,
         noise_std: float = 1.0,
-        sigma_hat_min: float = -2.0,
-        sigma_hat_max: float = 2.0,
+        sigma_hat_min: float = -1.5,
+        sigma_hat_max: float = 2.5,
         rng: Optional[np.random.RandomState] = None,
     ) -> np.ndarray:
         """
@@ -139,18 +139,18 @@ class ScreeningMechanism:
 
         # Where cost=0, skip and keep base; else add noise with cost-based std capped below public noise
         noise_sigma_hat = sigma_hat - sigma_true_arr
-        print("Difference between sigma_hat and sigma_true: ", noise_sigma_hat)
+        # print("Difference between sigma_hat and sigma_true: ", noise_sigma_hat) commenting out to speed up
 
-        if c_arr * lr > 2.7 or lr <= 0 or lr > 1 :
+        if np.any(c_arr * lr) > 2.7 or lr <= 0 or lr > 1 :
             raise ValueError("cost and learning rate cannot be larger then 2.7 by math")
 
         thing = c_arr * lr
         moving_step_size = ((noise_sigma_hat**2)/(1+noise_sigma_hat**2))*((thing**2)/(1+thing))
-        print("Step size: ", moving_step_size)
+        # print("Step size: ", moving_step_size) commenting out to speed up
         # this only help move one time step.
         sigma_tilde = sigma_hat - moving_step_size * np.sign(noise_sigma_hat)
 
-        print("simga_tilde after step: ", sigma_tilde)
+        # print("simga_tilde after step: ", sigma_tilde) commenting out to speed up
 
         # For zero-cost entries, keep base exactly
         zero_mask = c_arr == 0

@@ -150,10 +150,12 @@ def update_sigma_no_offer(sigma_hat):
 # Inline test / demo: two firms, ten workers, 20 timesteps
 # ----------------------------------------------------------------------
 
-def normal_between_0_1():
-    x = np.random.normal(0.5, 1)
+def normal_between_0_1(rng: Optional[np.random.RandomState] = None) -> float:
+    if rng is None:
+        rng = np.random
+    x = rng.normal(0.5, 1)
     while x < 0 or x > 1:   # reject negative values
-        x = np.random.normal(0.5, 1)
+        x = rng.normal(0.5, 1)
     return x
 
 

@@ -13,7 +13,7 @@ from generated_profit2 import (
     update_sigma_tilde_from_profit,
     update_sigma_hat_accepted,
     update_sigma_no_offer,
-    update_experience,
+    update_experience, normal_between_0_1,
 )
 from post_hiring_adjust_wage3 import default_g_bounded, adjust_wage_post_hire, firing_decision
 
@@ -73,6 +73,7 @@ class JobMarketEnv(ParallelEnv):
         self.public_signal_variance = public_signal_variance
         self.max_timesteps = max_timesteps
         self.firing_cost_multiplier = firing_cost_multiplier
+        self.offer_accept_greedy_chance = 0.8
 
         # Cap interview cost at 2.7 as requested
         max_cost = float(min(2.7, max_interview_cost))
@@ -195,7 +196,8 @@ class JobMarketEnv(ParallelEnv):
 
     def _init_state(self):
         self.timestep = 0
-        self.sigma_true = self.rng.randn(self.num_workers).astype(np.float32)
+        # limits sigma_true to [0,1]
+        self.sigma_true = np.array([normal_between_0_1(self.rng) for _ in range(self.num_workers)]).astype(np.float32)
         self.sigma_hat = ScreeningMechanism.init_sigma_hat(
             sigma_true=self.sigma_true,
             noise_std=np.sqrt(self.public_signal_variance),
@@ -204,7 +206,7 @@ class JobMarketEnv(ParallelEnv):
         self.sigma_tilde = np.tile(self.sigma_hat, (self.num_companies, 1)).astype(np.float32)
         base_var = self.screening.interview_var(0.0)
         self.interview_vars = np.full((self.num_companies, self.num_workers), base_var, dtype=np.float32)
-        self.experience = np.zeros(self.num_workers, dtype=np.float32)
+        self.experience = np.ones(self.num_workers, dtype=np.float32)
         self.tenure = np.zeros(self.num_workers, dtype=np.float32)
         self.employed_by = np.full(self.num_workers, -1, dtype=int)
         self.wages = np.zeros(self.num_workers, dtype=np.float32)
@@ -312,75 +314,10 @@ class JobMarketEnv(ParallelEnv):
         # 1) Interview with per-worker costs
         # Each firm can interview any worker; multiple firms can interview the same worker
         # Each firm that interviews a worker updates their own private belief σ̃_{ij}
-        for firm_idx, agent in enumerate(self.agents):
-            remaining_capacity = max(0, self._capacity(firm_idx) - int(np.sum(self.employed_by == firm_idx)))
-            if remaining_capacity <= 0:
-                continue
-
-            worker_costs = costs_per_worker[agent]  # (num_workers,)
-
-            # Firm interviews any unemployed worker with cost > 0
-            for worker_id in unemployed_workers:
-                cost_val = float(worker_costs[worker_id])
-                if cost_val > 0.0:  # Firm wants to interview this worker
-                    # Generate firm i's private signal about worker j: σ̃_{ij}
-                    # This is independent across firms (each gets their own noisy assessment)
-                    sigma_tilde_draw = self.screening.screen_worker(
-                        sigma_true=np.array([self.sigma_true[worker_id]], dtype=np.float32),
-                        interview_costs=np.array([cost_val], dtype=np.float32),
-                        sigma_hat=np.array([self.sigma_hat[worker_id]], dtype=np.float32),
-                    )[0]
-
-                    # Update firm i's private belief about worker j
-                    self.sigma_tilde[firm_idx, worker_id] = sigma_tilde_draw
-                    self.interview_vars[firm_idx, worker_id] = float(self.screening.interview_var(cost_val))
-                    interviewed_mask[firm_idx, worker_id] = True
-                    screening_costs[agent] += cost_val
+        self.step_interview(costs_per_worker, interviewed_mask, screening_costs, unemployed_workers)
 
         # 2) Matching: firms offer to 30% of the workers they interviewed
-        remaining_capacity = [
-            max(0, self._capacity(i) - int(np.sum(self.employed_by == i)))
-            for i in range(self.num_companies)
-        ]
-
-        # Generate offers from each firm
-        firm_offers = []
-        for firm_idx in range(self.num_companies):
-            offer = firm_offer(
-                sigma_tilde=self.sigma_tilde[firm_idx],
-                interviewed_mask=interviewed_mask[firm_idx],
-                offer_rate=0.3,
-                g=default_g_bounded,
-                firm_multiplier=self._wage_multiplier(firm_idx),
-                firm_id=firm_idx,
-            )
-            firm_offers.append(offer)
-
-        # Workers accept best offers
-        matching_results = worker_wage_accepted(firm_offers, self.sigma_tilde[0])
-
-        # Process accepted offers
-        for result in matching_results:
-            firm_id = result.firm_id
-            new_hires_mask = result.employeed_by.astype(bool)
-
-            for worker_id in np.where(new_hires_mask)[0]:
-                # Check constraints
-                if self.employed_by[worker_id] != -1:
-                    continue
-                if worker_id not in unemployed_workers:
-                    continue
-                if remaining_capacity[firm_id] <= 0:
-                    continue
-
-                # Get wage from firm's offer
-                wage_offer = firm_offers[firm_id].wage_array[worker_id]
-
-                # Hire the worker
-                self.employed_by[worker_id] = firm_id
-                self.wages[worker_id] = float(wage_offer) * self.wage_scale
-                self.tenure[worker_id] = 0.0
-                remaining_capacity[firm_id] -= 1
+        self.step_offers(interviewed_mask, unemployed_workers)
 
         # 3) Profit draw + wage adjustment + belief/experience update
         # Create binary mask: 1 if employed by any firm, 0 if unemployed
@@ -400,11 +337,10 @@ class JobMarketEnv(ParallelEnv):
             if firm_id < 0:
                 continue
             delta_interview_sq = float(self.interview_vars[firm_id, worker_id])
-            exp_t = max(float(self.experience[worker_id]), 1) # avoid division by zero
             wage = adjust_wage_post_hire(
                 sigma_tilde_interview=float(self.sigma_tilde[firm_id, worker_id]),
                 p_ij_tm1=float(profits_per_worker[worker_id]),
-                exp_t=exp_t,
+                exp_t=self.experience[worker_id],
                 delta_interview_sq=delta_interview_sq,
                 delta_eps_sq=self.delta_eps_sq,
                 psi=self.wage_profit_share,
@@ -452,13 +388,12 @@ class JobMarketEnv(ParallelEnv):
                 sigma_tilde_next[:, worker_id] = float(sigma_tilde_no_offer)
             else:
                 # worker employed, update beliefs based on profit
-                exp_t = max(float(self.experience[worker_id]), 1.0)
                 delta_interview_sq = float(self.interview_vars[firm_id, worker_id])
 
                 sigma_tilde_new, sigma_update, vx = update_sigma_tilde_from_profit(
                     sigma_tilde_interview=float(self.sigma_tilde[firm_id, worker_id]),
                     sigma_true=float(self.sigma_true[worker_id]),
-                    exp_t=exp_t,
+                    exp_t=self.experience[worker_id],
                     delta_interview_sq=delta_interview_sq,
                     delta_eps_sq=self.delta_eps_sq,
                 )
@@ -525,6 +460,80 @@ class JobMarketEnv(ParallelEnv):
             self.agents = []
 
         return observations, rewards, terminations, truncations, infos
+
+    def step_offers(self, interviewed_mask: np.ndarray[tuple[int, int], np.dtype[Any]],
+                    unemployed_workers: np.ndarray[tuple[Any, ...], np.dtype[np.int32 | np.int64]]):
+        remaining_capacity = [
+            max(0, self._capacity(i) - int(np.sum(self.employed_by == i)))
+            for i in range(self.num_companies)
+        ]
+
+        # Generate offers from each firm
+        firm_offers = []
+        for firm_idx in range(self.num_companies):
+            offer = firm_offer(
+                sigma_tilde=self.sigma_tilde[firm_idx],
+                interviewed_mask=interviewed_mask[firm_idx],
+                offer_rate=0.3,
+                g=default_g_bounded,
+                firm_multiplier=self._wage_multiplier(firm_idx),
+                firm_id=firm_idx,
+            )
+            firm_offers.append(offer)
+
+        # Workers accept best offers
+        matching_results = worker_wage_accepted(firm_offers=firm_offers, num_workers=self.num_workers, rnd=self.rng, greedy_chance=self.offer_accept_greedy_chance)
+
+        # Process accepted offers
+        for result in matching_results:
+            firm_id = result.firm_id
+            new_hires_mask = result.employeed_by.astype(bool)
+
+            for worker_id in np.where(new_hires_mask)[0]:
+                # Check constraints
+                if self.employed_by[worker_id] != -1:
+                    continue
+                if worker_id not in unemployed_workers:
+                    continue
+                if remaining_capacity[firm_id] <= 0:
+                    continue
+
+                # Get wage from firm's offer
+                wage_offer = firm_offers[firm_id].wage_array[worker_id]
+
+                # Hire the worker
+                self.employed_by[worker_id] = firm_id
+                self.wages[worker_id] = float(wage_offer) * self.wage_scale
+                self.tenure[worker_id] = 0.0
+                remaining_capacity[firm_id] -= 1
+
+    def step_interview(self, costs_per_worker: dict[Any, np.ndarray[tuple[Any, ...], np.dtype[Any]]],
+                       interviewed_mask: np.ndarray[tuple[int, int], np.dtype[Any]], screening_costs: dict[Any, float],
+                       unemployed_workers: np.ndarray[tuple[Any, ...], np.dtype[np.int32 | np.int64]]):
+        for firm_idx, agent in enumerate(self.agents):
+            remaining_capacity = max(0, self._capacity(firm_idx) - int(np.sum(self.employed_by == firm_idx)))
+            if remaining_capacity <= 0:
+                continue
+
+            worker_costs = costs_per_worker[agent]  # (num_workers,)
+
+            # Firm interviews any unemployed worker with cost > 0
+            for worker_id in unemployed_workers:
+                cost_val = float(worker_costs[worker_id])
+                if cost_val > 0.0:  # Firm wants to interview this worker
+                    # Generate firm i's private signal about worker j: σ̃_{ij}
+                    # This is independent across firms (each gets their own noisy assessment)
+                    sigma_tilde_draw = self.screening.screen_worker(
+                        sigma_true=np.array([self.sigma_true[worker_id]], dtype=np.float32),
+                        interview_costs=np.array([cost_val], dtype=np.float32),
+                        sigma_hat=np.array([self.sigma_hat[worker_id]], dtype=np.float32),
+                    )[0]
+
+                    # Update firm i's private belief about worker j
+                    self.sigma_tilde[firm_idx, worker_id] = sigma_tilde_draw
+                    self.interview_vars[firm_idx, worker_id] = float(self.screening.interview_var(cost_val))
+                    interviewed_mask[firm_idx, worker_id] = True
+                    screening_costs[agent] += cost_val
 
     def render(self):
         if self.render_mode != "human":
