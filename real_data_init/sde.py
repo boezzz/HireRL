@@ -266,7 +266,7 @@ def estimate_size_wage_premia(excel_path: str = None,
 # --------------------------------------------------------
 
 # 这里填你的真实路径；如果在本地/服务器上运行，这个路径要改成你的实际位置
-EXCEL_PATH = "/Users/joehisaishi/Library/CloudStorage/GoogleDrive-zhaijing@uw.edu/.shortcut-targets-by-id/1A8EblAG1p82E-7dXusgeL8h9ait30Ed9/Job Matching RL/sde_cleaned_Nov24.xlsx"
+EXCEL_PATH = "sde_cleaned_Nov24.xlsx"
 
 # 读入 Excel（默认读第一张表，如果你有多张表可以加 sheet_name 参数）
 df = pd.read_excel(EXCEL_PATH)
