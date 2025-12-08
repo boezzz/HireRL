@@ -395,10 +395,11 @@ def experiment_2_firing_costs(seed: int = 42, use_empirical: bool = False, base_
         if use_empirical and 'delta_interview0_sq' in empirical_params:
             env.screening.delta0_sq = float(empirical_params['delta_interview0_sq'])
 
+        run_name_prefix = base_run_dir.replace("runs/", "") if base_run_dir.startswith("runs/") else base_run_dir
         trainer = IPPOTrainer(
             env=env,
             lr=3e-3,
-            run_name=f"firing_cost_{c_fire}",
+            run_name=f"{run_name_prefix}/firing_cost_{c_fire}",
             seed=seed
         )
 
@@ -514,10 +515,11 @@ def experiment_3_market_structure(seed: int = 42, use_empirical: bool = False, b
         if use_empirical and 'delta_interview0_sq' in empirical_params:
             env.screening.delta0_sq = float(empirical_params['delta_interview0_sq'])
 
+        run_name_prefix = base_run_dir.replace("runs/", "") if base_run_dir.startswith("runs/") else base_run_dir
         trainer = IPPOTrainer(
             env=env,
             lr=3e-3,
-            run_name=f"market_{n_firms}f_{n_workers}w",
+            run_name=f"{run_name_prefix}/market_{n_firms}f_{n_workers}w",
             seed=seed
         )
 
@@ -589,39 +591,19 @@ def main(use_empirical: bool = False):
     print("\nEstimated time: ~10-15 minutes on M1 MacBook Pro")
     print("="*80 + "\n")
 
-    # Create base runs directory
+    # Create base runs directory with timestamp
     import time
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_suite_dir = f"runs/experiment_suite_{timestamp}"
-    os.makedirs(run_suite_dir, exist_ok=True)
+    suite_name = f"experiment_suite_{timestamp}"
+    run_suite_dir = f"runs/{suite_name}"
 
-    # Run experiments
     print(f"\n📁 All outputs will be saved under: {run_suite_dir}/\n")
 
-    baseline_dir, baseline_data = experiment_1_baseline(seed=42, use_empirical=use_empirical)
+    baseline_run_name = f"{suite_name}/baseline_learning_dynamics"
+    baseline_dir, baseline_data = experiment_1_baseline(seed=42, use_empirical=use_empirical, run_name=baseline_run_name)
+
     firing_results, firing_comparison_dir = experiment_2_firing_costs(seed=42, use_empirical=use_empirical, base_run_dir=run_suite_dir)
     market_results, market_comparison_dir = experiment_3_market_structure(seed=42, use_empirical=use_empirical, base_run_dir=run_suite_dir)
-
-    print("\n" + "="*80)
-    print(" "*25 + "ALL EXPERIMENTS COMPLETE!")
-    print("="*80)
-    print(f"\n📁 Main output directory: {run_suite_dir}/")
-    print("\n📊 Experiment outputs:")
-    print(f"\n1. Baseline Learning Dynamics:")
-    print(f"   {baseline_dir}/")
-    print(f"   ├── figures/fig1_learning_curves.png")
-    print(f"   ├── figures/fig2_learned_policy.png")
-    print(f"   └── results/baseline_eval_data.pkl")
-    print(f"\n2. Firing Cost Comparison:")
-    print(f"   {firing_comparison_dir}/")
-    print(f"   ├── figures/fig3_firing_cost_sensitivity.png")
-    print(f"   └── results/firing_cost_table.csv + .tex")
-    print(f"\n3. Market Structure Comparison:")
-    print(f"   {market_comparison_dir}/")
-    print(f"   └── results/market_structure_table.csv + .tex")
-    print("\n💡 TIP: View with TensorBoard:")
-    print(f"   tensorboard --logdir={run_suite_dir}")
-    print("="*80 + "\n")
 
 
 if __name__ == '__main__':
