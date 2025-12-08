@@ -300,6 +300,7 @@ class JobMarketEnv(ParallelEnv):
         if not self.agents:
             return {}, {}, {}, {}, {}
 
+        base_var = self.screening.interview_var(0.0)
         self.interview_vars = np.full((self.num_companies, self.num_workers), base_var, dtype=np.float32)
 
         # Map actions -> per-worker interview costs
