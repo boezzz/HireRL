@@ -174,7 +174,7 @@ def firing_decision(
     FiringDecisionResult
         Contains the firing indicator, the net margin, and the threshold.
     """
-    c_fire_t = 6.0 * wage  # deterministic: 6x current wage
+    c_fire_t = 2.0 * wage  # deterministic: 6x current wage
     margin = profit - wage
     threshold = -c_fire_t
     fire = margin < threshold
