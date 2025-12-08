@@ -1,10 +1,5 @@
 """
 Run all experiments for HireRL paper.
-
-Sections:
-- 3.2: Learning Dynamics (baseline training + evaluation)
-- 3.3: Firing Cost Sensitivity
-- 3.4: Market Structure
 """
 
 import sys
@@ -234,7 +229,7 @@ def extract_evaluation_metrics(
 
 def experiment_1_baseline(seed: int = 42, use_empirical: bool = False, run_name: Optional[str] = None):
     """
-    Section 3.2: Learning Dynamics
+    Learning Dynamics
 
     Train baseline policy and generate:
     - Learning curves (during training)
@@ -246,7 +241,7 @@ def experiment_1_baseline(seed: int = 42, use_empirical: bool = False, run_name:
         run_name: Optional custom run name for the trainer
     """
     print("\n" + "="*60)
-    print("EXPERIMENT 1: Learning Dynamics (Section 3.2)")
+    print("EXPERIMENT 1: Learning Dynamics")
     print("="*60)
 
     set_global_seed(seed)
@@ -339,7 +334,7 @@ def experiment_1_baseline(seed: int = 42, use_empirical: bool = False, run_name:
 
 def experiment_2_firing_costs(seed: int = 42, use_empirical: bool = False, base_run_dir: str = "runs"):
     """
-    Section 3.3: Firing Cost Sensitivity
+    Firing Cost Sensitivity
 
     Train separate policies for each firing cost multiplier.
 
@@ -347,9 +342,9 @@ def experiment_2_firing_costs(seed: int = 42, use_empirical: bool = False, base_
         seed: Random seed
         use_empirical: If True, use empirical data from SDE for initialization
         base_run_dir: Base directory for this experiment's outputs
-    """
+    """ 
     print("\n" + "="*60)
-    print("EXPERIMENT 2: Firing Cost Sensitivity (Section 3.3)")
+    print("EXPERIMENT 2: Firing Cost Sensitivity")
     print("="*60)
 
     firing_costs = [0.0, 3.0, 6.0]
@@ -454,7 +449,7 @@ def experiment_2_firing_costs(seed: int = 42, use_empirical: bool = False, base_
 
 def experiment_3_market_structure(seed: int = 42, use_empirical: bool = False, base_run_dir: str = "runs"):
     """
-    Section 3.4: Market Structure
+    Market Structure
 
     Train policies for different market configurations.
 
@@ -464,7 +459,7 @@ def experiment_3_market_structure(seed: int = 42, use_empirical: bool = False, b
         base_run_dir: Base directory for this experiment's outputs
     """
     print("\n" + "="*60)
-    print("EXPERIMENT 3: Market Structure (Section 3.4)")
+    print("EXPERIMENT 3: Market Structure")
     print("="*60)
 
     # Smaller configs for faster testing
