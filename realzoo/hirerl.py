@@ -369,7 +369,7 @@ class JobMarketEnv(ParallelEnv):
 
             if fire_result.fire:
                 # Fire the worker: set employment status to unemployed
-                c_fire = 6.0 * wage # maybe not hardcode this one
+                c_fire = self.firing_cost_multiplier * wage
                 self.employed_by[worker_id] = -1
                 self.tenure[worker_id] = 0.0
                 self.wages[worker_id] = 0.0
